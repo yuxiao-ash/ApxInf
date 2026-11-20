@@ -106,12 +106,20 @@ pub struct Pi05Weights {
 impl Pi05Weights {
     /// Load a single-file or sharded LeRobot/OpenPI SafeTensors checkpoint.
     pub fn from_safetensors(config: &Pi05Config, path: &Path) -> Result<Self> {
+        Self::from_safetensors_with_recipe(config, path, false)
+    }
+
+    pub(in crate::ascend_pi05) fn from_safetensors_with_recipe(
+        config: &Pi05Config,
+        path: &Path,
+        int8: bool,
+    ) -> Result<Self> {
         let io_start = std::time::Instant::now();
         let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
             .map_err(|error| Error::Other(format!("load π0.5 SafeTensors: {error}")))?;
         let io_elapsed = io_start.elapsed();
         let map_start = std::time::Instant::now();
-        let result = Self::from_map(config, tensors);
+        let result = Self::from_map_with_recipe(config, tensors, int8);
         eprintln!(
             "[apxinf] from_safetensors: io={:.3}s from_map={:.3}s total={:.3}s",
             io_elapsed.as_secs_f64(),
@@ -123,7 +131,15 @@ impl Pi05Weights {
 
     /// Consume a LeRobot/OpenPI π0.5 safetensors map and validate every tensor
     /// required by the inference graph. Unused action LM-head weights may remain.
-    pub fn from_map(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+    pub fn from_map(config: &Pi05Config, tensors: HashMap<String, Tensor>) -> Result<Self> {
+        Self::from_map_with_recipe(config, tensors, false)
+    }
+
+    pub(super) fn from_map_with_recipe(
+        config: &Pi05Config,
+        mut tensors: HashMap<String, Tensor>,
+        int8: bool,
+    ) -> Result<Self> {
         config.validate()?;
         normalize_lerobot_prefix(&mut tensors);
 
@@ -240,41 +256,34 @@ impl Pi05Weights {
                     s.spawn(move || {
                         let attention = GemmaAttentionWeights {
                             q: LinearWeights {
-                                weight: transpose_and_fold(
-                                    &raw.q_weight,
-                                    &raw.attention_scale,
-                                )?,
+                                weight: transpose_and_fold(&raw.q_weight, &raw.attention_scale)?,
                                 bias: None,
                             },
                             k: LinearWeights {
-                                weight: transpose_and_fold(
-                                    &raw.k_weight,
-                                    &raw.attention_scale,
-                                )?,
+                                weight: transpose_and_fold(&raw.k_weight, &raw.attention_scale)?,
                                 bias: None,
                             },
                             v: LinearWeights {
-                                weight: transpose_and_fold(
-                                    &raw.v_weight,
-                                    &raw.attention_scale,
-                                )?,
+                                weight: transpose_and_fold(&raw.v_weight, &raw.attention_scale)?,
                                 bias: None,
                             },
                             output: raw.o_linear,
                         };
                         let mlp = GemmaMlpWeights {
                             gate: LinearWeights {
-                                weight: transpose_and_fold(
-                                    &raw.gate_weight,
-                                    &raw.mlp_scale,
-                                )?,
+                                weight: if int8 {
+                                    transpose_2d(&raw.gate_weight)?
+                                } else {
+                                    transpose_and_fold(&raw.gate_weight, &raw.mlp_scale)?
+                                },
                                 bias: None,
                             },
                             up: LinearWeights {
-                                weight: transpose_and_fold(
-                                    &raw.up_weight,
-                                    &raw.mlp_scale,
-                                )?,
+                                weight: if int8 {
+                                    transpose_2d(&raw.up_weight)?
+                                } else {
+                                    transpose_and_fold(&raw.up_weight, &raw.mlp_scale)?
+                                },
                                 bias: None,
                             },
                             down: raw.down_linear,
@@ -282,7 +291,11 @@ impl Pi05Weights {
                         Ok(LanguageLayerWeights {
                             input_norm_scale: ones(raw.attention_scale.shape().dims())?,
                             attention,
-                            post_attention_norm_scale: ones(raw.mlp_scale.shape().dims())?,
+                            post_attention_norm_scale: if int8 {
+                                raw.mlp_scale
+                            } else {
+                                ones(raw.mlp_scale.shape().dims())?
+                            },
                             mlp,
                         })
                     })

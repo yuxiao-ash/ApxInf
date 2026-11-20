@@ -1,20 +1,13 @@
-//! Load PI0.5 assets and assemble the Ascend model runner (BF16 only).
+//! Load PI0.5 assets and assemble the Ascend model runner (BF16 residuals and selective INT8).
 
-use super::model::{
-    build_bf16_model_with_policies, L3Policies, ModelVariant,
-};
+use super::model::{build_bf16_model_with_policies, L3Policies, ModelVariant};
 use super::*;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
-use apxinf_core::{Device, Error};
 use apxinf_core::Result;
+use apxinf_core::{Device, Error};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Load PI0.5 assets and assemble the Ascend model runner (BF16 only).
-///
-/// `config` mirrors the sibling `hip_pi05` / `musa_pi05` seams: when the caller
-/// passes an explicit frontend config it wins, otherwise the checkpoint's
-/// `config.json` is read, and a bare directory falls back to the defaults.
 pub(crate) fn load(
     path: &Path,
     device: Device,
@@ -22,7 +15,7 @@ pub(crate) fn load(
     config: Option<Pi05Config>,
 ) -> Result<LoadedModel> {
     let Device::Npu(device_id) = device else {
-        return Err(Error::Other(format!("PI0.5 requires Ascend, not {device}")));
+        return Err(Error::Other("PI0.5 Ascend requires Device::Npu".into()));
     };
     let context = Arc::new(backend::Context::new(device_id)?);
     Ok(LoadedModel::Vla(Box::new(load_model_runner(
@@ -36,14 +29,8 @@ pub(super) fn load_model_runner(
     options: &LoadOptions,
     config: Option<Pi05Config>,
 ) -> Result<Pi05ModelRunner> {
-    // Parse model_variant up front so an invalid choice fails before any
-    // weight upload work starts; the policies are the single BF16 set.
-    let _ = options
-        .model_variant
-        .as_deref()
-        .unwrap_or("bf16")
-        .parse::<ModelVariantChoice>()?;
-    load_model_runner_with_policies(path, backend, options, config, L3Policies::default())
+    let policies = L3Policies::default();
+    load_model_runner_with_policies(path, backend, options, config, policies)
 }
 
 fn load_model_runner_with_policies(
@@ -55,48 +42,53 @@ fn load_model_runner_with_policies(
 ) -> Result<Pi05ModelRunner> {
     let root = artifact_root(path);
     let config_path = root.join("config.json");
-    // An explicit frontend config wins (auto.rs maps `pi05::Pi05Config` into
-    // this crate's copy); otherwise read the checkpoint's own `config.json`.
     let config = Arc::new(match config {
         Some(config) => config,
         None if config_path.is_file() => Pi05Config::from_json_file(&config_path)?,
         None => Pi05Config::default(),
     });
-    let synthetic = options.synthetic;
-    let gen_start = std::time::Instant::now();
-    let host_weights = match synthetic {
-        Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
-        None => Pi05Weights::from_safetensors(&config, path)?,
-    };
-    eprintln!(
-        "[apxinf] host_weights generation: {:.3}s",
-        gen_start.elapsed().as_secs_f64()
-    );
     if options.precision != ModelPrecision::Auto {
         return Err(Error::Other(
             "PI0.5 uses model_variant instead of precision".into(),
         ));
     }
 
-    // Ascend ships a single BF16 implementation.
     let model_variant = options
         .model_variant
         .as_deref()
         .unwrap_or("bf16")
         .parse::<ModelVariantChoice>()?;
-    if model_variant != ModelVariantChoice::Bf16 {
-        return Err(Error::Other(format!(
-            "PI0.5 Ascend supports bf16 only, got {model_variant:?}"
-        )));
-    }
+    let int8 = match model_variant {
+        ModelVariantChoice::Auto | ModelVariantChoice::Bf16 => false,
+        ModelVariantChoice::Int8Dynamic => true,
+        _ => {
+            return Err(Error::Other(
+                "PI0.5 Ascend supports bf16 or int8_dynamic".into(),
+            ))
+        }
+    };
     eprintln!(
         "[apxinf] PI0.5 Ascend model_variant={}",
-        model_variant.as_str()
+        if int8 { "int8_dynamic" } else { "bf16" }
     );
 
+    let synthetic = options.synthetic;
+    let gen_start = std::time::Instant::now();
+    let host_weights = match synthetic {
+        Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
+        None => Pi05Weights::from_safetensors_with_recipe(&config, path, int8)?,
+    };
+    eprintln!(
+        "[apxinf] host_weights generation: {:.3}s",
+        gen_start.elapsed().as_secs_f64()
+    );
     apxinf_ascend::l3::reset_h2d_diagnostics();
     let weights_start = std::time::Instant::now();
-    let weights = Arc::new(Bf16Weights::from_host(&host_weights, &*backend)?);
+    let weights = Arc::new(if int8 {
+        Bf16Weights::from_host_selective_int8(&host_weights, &backend)?
+    } else {
+        Bf16Weights::from_host(&host_weights, &backend)?
+    });
     let weights_enqueue = weights_start.elapsed();
     // Synchronize stream once — all weight H2D copies were async.
     backend::synchronize(&backend)?;
@@ -124,18 +116,25 @@ fn load_model_runner_with_policies(
     );
     apxinf_ascend::l3::print_h2d_diagnostics();
     let model_start = std::time::Instant::now();
-    let model = ModelVariant::Bf16 {
-        model: build_bf16_model_with_policies(
-            Arc::clone(&backend),
-            Arc::clone(&config),
-            weights,
-            policies,
-        )?,
-        time_embeddings,
+    let computation = build_bf16_model_with_policies(
+        Arc::clone(&backend),
+        Arc::clone(&config),
+        weights,
+        policies,
+    )?;
+    let model = if int8 {
+        ModelVariant::Int8Dynamic {
+            model: computation,
+            time_embeddings,
+        }
+    } else {
+        ModelVariant::Bf16 {
+            model: computation,
+            time_embeddings,
+        }
     };
     eprintln!(
-        "[apxinf] build_model ({}) {:.3}s",
-        model_variant.as_str(),
+        "[apxinf] build_bf16_model: {:.3}s",
         model_start.elapsed().as_secs_f64()
     );
 

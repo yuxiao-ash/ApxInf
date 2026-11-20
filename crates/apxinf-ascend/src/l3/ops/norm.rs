@@ -319,6 +319,9 @@ pub fn layer_norm(ctx: &AscendNewContext, args: LayerNormArgs<'_>) -> Result<()>
 /// Adaptive RMS norm: split norm_style into scale + shift, then
 /// `normalized = rms_norm(input) * scale + shift`.
 pub fn adaptive_rms_norm(ctx: &AscendNewContext, args: AdaptiveRmsNormArgs<'_>) -> Result<()> {
+    #[cfg(feature = "910b-fusions")]
+    if super::fusions_910b::try_adarms(ctx, args.input, args.norm_style, args.normalized, args.eps)? { return Ok(()); }
+
     let stream = ctx.raw_stream();
     let dtype = args.input.dtype();
     let shape = args.input.shape().clone();
@@ -601,6 +604,9 @@ pub fn bias_residual_rms_norm(ctx: &AscendNewContext, args: BiasResidualRmsNormA
 
 /// Bias + residual + Layer norm.
 pub fn bias_residual_layer_norm(ctx: &AscendNewContext, args: BiasResidualLayerNormArgs<'_>) -> Result<()> {
+    #[cfg(feature = "910b-fusions")]
+    if args.input.dtype() == DType::BF16 { return add_layer_norm_910b(ctx, args); }
+
     // Step 1: hidden = (input + bias) + residual (reuse bias_residual)
     bias_residual(ctx, BiasResidualArgs::new(args.input, args.bias, args.residual, args.hidden))?;
 
@@ -610,6 +616,9 @@ pub fn bias_residual_layer_norm(ctx: &AscendNewContext, args: BiasResidualLayerN
 
 /// AdaGate residual: `hidden = input * gate_style[2*cols:3*cols] + residual`.
 pub fn ada_gate_residual(ctx: &AscendNewContext, args: AdaGateResidualArgs<'_>) -> Result<()> {
+    #[cfg(feature = "910b-fusions")]
+    if super::fusions_910b::try_gate(ctx, args.input, args.gate_style, args.residual, args.hidden)? { return Ok(()); }
+
     let stream = ctx.raw_stream();
     let dtype = args.input.dtype();
     let shape = args.input.shape().clone();
@@ -841,4 +850,31 @@ pub fn add_layer_norm(ctx: &AscendNewContext, mut args: AddLayerNormArgs<'_>) ->
         "aclnnAddLayerNorm",
     )
     .map_err(|e| Error::Other(format!("add_layer_norm: {e}")))
+}
+
+#[cfg(feature = "910b-fusions")]
+fn add_layer_norm_910b(ctx: &AscendNewContext, args: BiasResidualLayerNormArgs<'_>) -> Result<()> {
+    let dtype = args.input.dtype();
+    let dims = args.input.shape().dims();
+    let cols = dims[dims.len()-1];
+    let rows = args.input.shape().numel()/cols;
+    let mean = ctx.allocate_output(Shape::new(vec![rows,1]), DType::F32)?;
+    let rstd = ctx.allocate_output(Shape::new(vec![rows,1]), DType::F32)?;
+    let input = acl_tensor(args.input, dtype);
+    let residual = acl_tensor(args.residual, dtype);
+    let gamma = acl_tensor(args.weight, dtype);
+    let beta = acl_tensor(args.norm_bias, dtype);
+    let bias = args.bias.map(|t| acl_tensor(t, dtype));
+    let hidden = acl_tensor(args.hidden, dtype);
+    let norm = acl_tensor(args.normalized, dtype);
+    let mean = acl_tensor(&mean, DType::F32);
+    let rstd = acl_tensor(&rstd, DType::F32);
+    run_op(
+        |ws, exec| unsafe { ffi::aclnnAddLayerNormGetWorkspaceSize(
+            input.raw(), residual.raw(), gamma.raw(), beta.raw(),
+            bias.as_ref().map_or(std::ptr::null(), |b| b.raw()), args.eps as f64, true,
+            norm.raw(), mean.raw(), rstd.raw(), hidden.raw(), ws, exec) },
+        |ws, size, exec, stream| unsafe { ffi::aclnnAddLayerNorm(ws, size, exec, stream) },
+        ctx.raw_stream(), "aclnnAddLayerNorm"
+    ).map_err(|e| Error::Other(format!("aclnnAddLayerNorm: {e}")))
 }

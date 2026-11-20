@@ -2,10 +2,10 @@
 //!
 //! Mirrors `apxinf_cuda_new::transfers`.
 
-use apxinf_core::{Device, DType, Error, Result, Shape, Storage, Tensor};
 use crate::buffer::AscendBuffer as InnerBuffer;
 use crate::ffi::acl::aclrtStream;
 use crate::transfers;
+use apxinf_core::{DType, Device, Error, Result, Shape, Storage, Tensor};
 
 /// Copy a CPU tensor to NPU device memory (synchronous).
 pub fn to_npu(tensor: &Tensor, device_id: usize) -> Result<Tensor> {
@@ -131,6 +131,21 @@ pub fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
         Storage::Gpu { handle, .. } => handle.ptr(),
         _ => return Err(Error::Other("to_cpu: not a device tensor".into())),
     };
+    if let Storage::Gpu { handle, .. } = tensor.storage() {
+        if let Some(owner) = handle
+            .owner()
+            .and_then(|o| o.downcast_ref::<super::context::RetainedOutput>())
+        {
+            let context = owner.context.lock().unwrap();
+            unsafe {
+                crate::ffi::acl::check(
+                    crate::ffi::acl::aclrtSetCurrentContext(context.raw_context()),
+                    "restore retained output context",
+                )
+            }
+            .map_err(Error::Other)?;
+        }
+    }
     let num_bytes = tensor.size_in_bytes();
     let mut cpu_buf = vec![0u8; num_bytes];
     transfers::d2h(

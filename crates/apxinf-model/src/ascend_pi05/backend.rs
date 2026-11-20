@@ -15,7 +15,11 @@ pub(crate) fn to_device(ctx: &Context, tensor: &Tensor) -> Result<Tensor> {
     ctx.ensure_context();
     // Use async H2D to avoid per-copy host blocking. The caller (Bf16Weights::from_host)
     // does a single synchronize after all weights are uploaded.
-    transfers::to_npu_async(tensor, ctx.device_id(), ctx.raw_stream())
+    ctx.retain_output(&transfers::to_npu_async(
+        tensor,
+        ctx.device_id(),
+        ctx.raw_stream(),
+    )?)
 }
 
 pub(crate) fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
@@ -24,7 +28,8 @@ pub(crate) fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
 
 pub(crate) fn synchronize(ctx: &Context) -> Result<()> {
     ctx.ensure_context();
-    ctx.synchronize().map_err(|e| Error::Other(format!("ascend sync: {e}")))
+    ctx.synchronize()
+        .map_err(|e| Error::Other(format!("ascend sync: {e}")))
 }
 
 pub(crate) fn create_normal_generator(

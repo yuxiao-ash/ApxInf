@@ -53,6 +53,7 @@ musa-mttx = ["musa", "apxinf-musa/mttx"]
 # and MUSA features: any of them may be enabled together, and a process then
 # holds several backends at once.
 ascend = ["dep:apxinf-ascend"]
+ascend-910b-fusions = ["ascend", "apxinf-ascend/910b-fusions"]
 
 [[example]]
 name = "pi05_bench"
@@ -65,6 +66,10 @@ required-features = ["cuda"]
 [[example]]
 name = "pi05_hip_bench"
 required-features = ["hip"]
+
+[[example]]
+name = "pi05_ascend_bench"
+required-features = ["ascend"]
 
 [[example]]
 name = "gr00t_bench"

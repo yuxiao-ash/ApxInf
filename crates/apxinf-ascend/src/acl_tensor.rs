@@ -99,6 +99,69 @@ impl AclTensor {
         Self { raw }
     }
 
+    #[cfg(feature = "910b-fusions")]
+    // Physical [N,K], logical [K,N] for transposed-B GEMM.
+    pub(crate) fn from_device_transposed_2d(ptr: usize, k: usize, n: usize, dtype: DType) -> Self {
+        let dims = [k as i64, n as i64];
+        let strides = [1i64, k as i64];
+        let storage = [n as i64, k as i64];
+        let raw = unsafe {
+            aclnn::aclCreateTensor(
+                dims.as_ptr(),
+                2,
+                acl_dtype(dtype),
+                strides.as_ptr(),
+                0,
+                aclnn::aclFormat::ACL_FORMAT_ND,
+                storage.as_ptr(),
+                2,
+                ptr as *mut c_void,
+            )
+        };
+        Self { raw }
+    }
+
+    #[cfg(feature = "910b-fusions")]
+    pub(crate) fn from_device_nz_i8(ptr: usize, k: usize, n: usize) -> Self {
+        let dims = [k as i64, n as i64];
+        let strides = [n as i64, 1];
+        let storage = [(n / 32) as i64, (k / 16) as i64, 16, 32];
+        let raw = unsafe {
+            aclnn::aclCreateTensor(
+                dims.as_ptr(),
+                2,
+                acl_dtype(DType::I8),
+                strides.as_ptr(),
+                0,
+                aclnn::aclFormat::ACL_FORMAT_FRACTAL_NZ,
+                storage.as_ptr(),
+                4,
+                ptr as *mut c_void,
+            )
+        };
+        Self { raw }
+    }
+
+    #[cfg(feature = "910b-fusions")]
+    pub(crate) fn from_device_nz_bf16(ptr: usize, k: usize, n: usize) -> Self {
+        let dims = [k as i64, n as i64];
+        let strides = [n as i64, 1];
+        let storage = [(n / 16) as i64, (k / 16) as i64, 16, 16];
+        let raw = unsafe {
+            aclnn::aclCreateTensor(
+                dims.as_ptr(),
+                2,
+                acl_dtype(DType::BF16),
+                strides.as_ptr(),
+                0,
+                aclnn::aclFormat::ACL_FORMAT_FRACTAL_NZ,
+                storage.as_ptr(),
+                4,
+                ptr as *mut c_void,
+            )
+        };
+        Self { raw }
+    }
     pub fn raw(&self) -> *mut aclnn::aclTensor {
         self.raw
     }
@@ -190,11 +253,24 @@ pub struct AclTensorList {
 }
 
 impl AclTensorList {
+    /// Transfer child descriptor ownership to CANN's tensor list.
+    pub(crate) fn from_owned(tensors: Vec<AclTensor>) -> apxinf_core::Result<Self> {
+        let pointers: Vec<_> = tensors.iter().map(|t| t.raw() as *const _).collect();
+        let list = Self::new(&pointers);
+        if list.raw.is_null() {
+            return Err(apxinf_core::Error::Other(
+                "aclCreateTensorList failed".into(),
+            ));
+        }
+        for tensor in tensors {
+            std::mem::forget(tensor);
+        }
+        Ok(list)
+    }
+
     /// Create an aclTensorList from a slice of aclTensor raw pointers.
     pub fn new(tensors: &[*const aclnn::aclTensor]) -> Self {
-        let raw = unsafe {
-            aclnn::aclCreateTensorList(tensors.as_ptr(), tensors.len() as u64)
-        };
+        let raw = unsafe { aclnn::aclCreateTensorList(tensors.as_ptr(), tensors.len() as u64) };
         Self { raw }
     }
 
@@ -250,6 +326,7 @@ const WORKSPACE_ALIGNMENT: usize = 256;
 pub struct WorkspacePool {
     base: *mut c_void,
     capacity: usize,
+    arena: apxinf_core::storage::GpuStorageHandle,
     offset: Cell<usize>,
     device_id: i32,
     /// Individually `aclrtMalloc`'d buffers that overflowed the pool. The
@@ -261,7 +338,7 @@ pub struct WorkspacePool {
     ///  - `true` (RI capture): the buffer's address is baked into the captured
     ///    graph and must survive replays, so it is kept until the pool drops
     ///    (the caller destroys the graph before the session/pool).
-    overflow: RefCell<Vec<(bool, *mut c_void)>>,
+    overflow: RefCell<Vec<(bool, apxinf_core::storage::GpuStorageHandle)>>,
 }
 
 impl WorkspacePool {
@@ -271,6 +348,7 @@ impl WorkspacePool {
             return Ok(Self {
                 base: ptr::null_mut(),
                 capacity: 0,
+                arena: unsafe { apxinf_core::storage::GpuStorageHandle::from_raw_parts(0, 0, None) },
                 offset: Cell::new(0),
                 device_id,
                 overflow: RefCell::new(Vec::new()),
@@ -301,6 +379,14 @@ impl WorkspacePool {
         Ok(Self {
             base: dev_ptr,
             capacity,
+            arena: unsafe {
+                crate::buffer::AscendBuffer::from_owned_raw_ptr(
+                    dev_ptr as usize,
+                    capacity,
+                    device_id as usize,
+                )
+            }
+            .to_storage_handle(),
             offset: Cell::new(0),
             device_id,
             overflow: RefCell::new(Vec::new()),
@@ -315,7 +401,8 @@ impl WorkspacePool {
             return Ok((ptr::null_mut(), false));
         }
         let bytes_usize = bytes as usize;
-        let aligned_start = (self.offset.get() + WORKSPACE_ALIGNMENT - 1) & !(WORKSPACE_ALIGNMENT - 1);
+        let aligned_start =
+            (self.offset.get() + WORKSPACE_ALIGNMENT - 1) & !(WORKSPACE_ALIGNMENT - 1);
         let end = aligned_start + bytes_usize;
         if end <= self.capacity {
             self.offset.set(end);
@@ -368,8 +455,39 @@ impl WorkspacePool {
     /// into the graph). Either way the allocation is never leaked.
     pub fn register_overflow(&self, ptr: *mut c_void, pinned: bool) {
         if !ptr.is_null() {
-            self.overflow.borrow_mut().push((pinned, ptr));
+            let owner = unsafe {
+                crate::buffer::AscendBuffer::from_owned_raw_ptr(
+                    ptr as usize,
+                    0,
+                    self.device_id as usize,
+                )
+            }
+            .to_storage_handle();
+            self.overflow.borrow_mut().push((pinned, owner));
         }
+    }
+
+    /// Keep the arena or registered overflow allocation alive with an output
+    /// view. The bump cursor/session remains thread-local; only memory is shared.
+    pub(crate) fn output_handle(
+        &self,
+        address: usize,
+        bytes: usize,
+    ) -> Option<apxinf_core::storage::GpuStorageHandle> {
+        let base = self.base as usize;
+        let end = address.checked_add(bytes)?;
+        let owner = if address >= base && end <= base.checked_add(self.capacity)? {
+            self.arena.owner()?.clone()
+        } else {
+            self.overflow
+                .borrow()
+                .iter()
+                .find(|(_, h)| h.ptr() == address)?
+                .1
+                .owner()?
+                .clone()
+        };
+        Some(unsafe { apxinf_core::storage::GpuStorageHandle::from_raw_parts(address, bytes, Some(owner)) })
     }
 
     /// Free overflow buffers that are not pinned. Safe because callers
@@ -377,12 +495,10 @@ impl WorkspacePool {
     fn free_unpinned_overflow(&self) {
         crate::context::restore_context();
         let mut v = self.overflow.borrow_mut();
-        let mut keep: Vec<(bool, *mut c_void)> = Vec::with_capacity(v.len());
-        for (pinned, p) in v.drain(..) {
+        let mut keep = Vec::with_capacity(v.len());
+        for (pinned, handle) in v.drain(..) {
             if pinned {
-                keep.push((pinned, p));
-            } else if !p.is_null() {
-                unsafe { acl::aclrtFree(p) };
+                keep.push((pinned, handle));
             }
         }
         *v = keep;
@@ -393,24 +509,6 @@ impl WorkspacePool {
 // operations which are serialized. The bump cursor is only modified by
 // the thread holding the session.
 unsafe impl Send for WorkspacePool {}
-
-impl Drop for WorkspacePool {
-    fn drop(&mut self) {
-        // Free any remaining overflow buffers (pinned capture-time buffers in
-        // particular — the RI graph referencing them is destroyed before the
-        // pool drops, per the runner drop order).
-        let overflow = std::mem::take(&mut *self.overflow.borrow_mut());
-        for (_pinned, p) in overflow.iter() {
-            if !p.is_null() {
-                unsafe { acl::aclrtFree(*p) };
-            }
-        }
-        // Free the pool arena itself.
-        if !self.base.is_null() {
-            unsafe { acl::aclrtFree(self.base) };
-        }
-    }
-}
 
 // ── Thread-local session state ───────────────────────────────────────
 
@@ -472,7 +570,8 @@ pub fn print_diagnostics() {
         let (free, total) = get_mem_info(crate::ffi::acl::aclrtMemAttr::ACL_HBM_MEM);
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         let fmt = |v: Option<usize>| -> String {
-            v.map(|x| format!("{:.1}", mb(x))).unwrap_or_else(|| "n/a".into())
+            v.map(|x| format!("{:.1}", mb(x)))
+                .unwrap_or_else(|| "n/a".into())
         };
         eprintln!(
             "[diag-mem] forward overflow.allocs={ov_cnt} bytes={:.1}MB | hbm.free={}MB hbm.total={}MB",

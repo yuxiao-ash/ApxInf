@@ -12,6 +12,8 @@ mod linear {
     #[derive(Debug)]
     pub struct Bf16LinearWeights {
         pub weight: Tensor,
+        /// F32 per-output-channel scales when weight contains INT8 codes.
+        pub channel_scales: Option<Tensor>,
         pub bias: Option<Tensor>,
     }
 
@@ -37,18 +39,25 @@ mod linear {
             let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
                 None
             } else if linears.iter().all(|linear| linear.bias.is_some()) {
-                Some(backend::to_device(context, &concat_biases_bf16(
-                    &linears
-                        .iter()
-                        .map(|linear| linear.bias.as_ref().unwrap())
-                        .collect::<Vec<_>>(),
-                )?)?)
+                Some(backend::to_device(
+                    context,
+                    &concat_biases_bf16(
+                        &linears
+                            .iter()
+                            .map(|linear| linear.bias.as_ref().unwrap())
+                            .collect::<Vec<_>>(),
+                    )?,
+                )?)
             } else {
                 return Err(Error::Other(
                     "cannot pack BF16 projections with mixed bias presence".into(),
                 ));
             };
-            Ok(Self { weight, bias })
+            Ok(Self {
+                weight,
+                bias,
+                channel_scales: None,
+            })
         }
     }
 
@@ -101,8 +110,8 @@ pub use linear::*;
 
 // Fully materialized native-BF16 PI0.5 weights (Ascend device).
 
-use apxinf_core::{Result, Tensor};
 use crate::ascend_pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::ascend_pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,
@@ -167,6 +176,14 @@ pub struct Bf16Weights {
 
 impl Bf16Weights {
     pub fn from_host(weights: &Pi05Weights, backend: &Context) -> Result<Self> {
+        Self::from_host_with_recipe(weights, backend, false)
+    }
+
+    pub fn from_host_selective_int8(weights: &Pi05Weights, backend: &Context) -> Result<Self> {
+        Self::from_host_with_recipe(weights, backend, true)
+    }
+
+    fn from_host_with_recipe(weights: &Pi05Weights, backend: &Context, int8: bool) -> Result<Self> {
         Ok(Self {
             patch_embedding: Bf16LinearWeights::from_host(
                 &weights.vision.patch_embedding,
@@ -177,7 +194,7 @@ impl Bf16Weights {
                 .vision
                 .blocks
                 .iter()
-                .map(|layer| Bf16DeviceVisionBlock::from_host(layer, backend))
+                .map(|layer| Bf16DeviceVisionBlock::from_host(layer, backend, int8))
                 .collect::<Result<Vec<_>>>()?,
             vision_post_norm: Bf16DeviceLayerNorm::from_host(
                 &weights.vision.post_layer_norm,
@@ -191,7 +208,7 @@ impl Bf16Weights {
             language_layers: weights
                 .language_layers
                 .iter()
-                .map(|layer| Bf16DeviceLanguageLayer::from_host(layer, backend))
+                .map(|layer| Bf16DeviceLanguageLayer::from_host(layer, backend, int8))
                 .collect::<Result<Vec<_>>>()?,
             language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
             action_layers: weights
@@ -218,7 +235,7 @@ impl Bf16DeviceLayerNorm {
 }
 
 impl Bf16DeviceVisionBlock {
-    fn from_host(weights: &VisionBlockWeights, backend: &Context) -> Result<Self> {
+    fn from_host(weights: &VisionBlockWeights, backend: &Context, int8: bool) -> Result<Self> {
         Ok(Self {
             norm1: Bf16DeviceLayerNorm::from_host(&weights.norm1, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -228,13 +245,13 @@ impl Bf16DeviceVisionBlock {
             output: Bf16LinearWeights::from_host(&weights.output, backend)?,
             norm2: Bf16DeviceLayerNorm::from_host(&weights.norm2, backend)?,
             fc1: Bf16LinearWeights::from_host(&weights.fc1, backend)?,
-            fc2: Bf16LinearWeights::from_host(&weights.fc2, backend)?,
+            fc2: selective_linear(&[&weights.fc2], backend, int8)?,
         })
     }
 }
 
 impl Bf16DeviceLanguageLayer {
-    fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
+    fn from_host(weights: &LanguageLayerWeights, backend: &Context, int8: bool) -> Result<Self> {
         Ok(Self {
             input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -245,13 +262,10 @@ impl Bf16DeviceLanguageLayer {
                 ],
                 backend,
             )?,
-            output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
+            output: selective_linear(&[&weights.attention.output], backend, int8)?,
             post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
-            gate_up: Bf16LinearWeights::from_host_parts(
-                &[&weights.mlp.up, &weights.mlp.gate],
-                backend,
-            )?,
-            down: Bf16LinearWeights::from_host(&weights.mlp.down, backend)?,
+            gate_up: selective_linear(&[&weights.mlp.up, &weights.mlp.gate], backend, int8)?,
+            down: selective_linear(&[&weights.mlp.down], backend, int8)?,
         })
     }
 }
@@ -286,4 +300,16 @@ fn modulation_to_device(
     backend: &Context,
 ) -> Result<Bf16LinearWeights> {
     Bf16LinearWeights::from_host(&weights.modulation, backend)
+}
+
+fn selective_linear(
+    parts: &[&crate::ascend_pi05::LinearWeights],
+    ctx: &Context,
+    int8: bool,
+) -> Result<Bf16LinearWeights> {
+    if int8 {
+        super::int8_dynamic::from_host_parts(parts, ctx)
+    } else {
+        Bf16LinearWeights::from_host_parts(parts, ctx)
+    }
 }
