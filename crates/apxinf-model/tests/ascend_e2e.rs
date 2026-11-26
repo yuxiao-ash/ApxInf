@@ -391,18 +391,30 @@ fn ascend_synthetic_e2e_inference_repeated() {
 #[test]
 #[ignore = "requires an Ascend NPU and original PI0.5 checkpoint"]
 fn ascend_int8_preparation_lifecycle() {
+    ascend_preparation_lifecycle("int8_dynamic");
+}
+
+#[cfg(feature = "ascend")]
+#[test]
+#[ignore = "requires an Ascend NPU and original PI0.5 checkpoint"]
+fn ascend_bf16_preparation_lifecycle() {
+    ascend_preparation_lifecycle("bf16");
+}
+
+#[cfg(feature = "ascend")]
+fn ascend_preparation_lifecycle(variant: &str) {
     use apxinf_core::Tensor;
     use apxinf_model::{ExecutionMode, ExecutionPolicy, PreparationStatus};
     let checkpoint = std::env::var("APXINF_WEIGHTS_PATH").expect("original checkpoint path");
     let options = LoadOptions {
         model_name: Some("pi05".into()),
-        model_variant: Some("int8_dynamic".into()),
+        model_variant: Some(variant.into()),
         ..LoadOptions::default()
     };
     let loaded =
         AutoModel::load_model(Device::Npu(0), std::path::Path::new(&checkpoint), &options).unwrap();
     let vla = loaded.vla().unwrap();
-    assert_eq!(vla.model_variant(), Some("int8_dynamic"));
+    assert_eq!(vla.model_variant(), Some(variant));
     let c = vla.contract();
     let observation = Observation {
         vision: VisionObservation::RgbU8 {

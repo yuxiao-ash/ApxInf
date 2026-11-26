@@ -408,6 +408,14 @@ fn weight_descriptor(
     weight: &Tensor,
     version: Option<WeightVersion>,
 ) -> Result<crate::acl_tensor::AclTensor> {
+    // Large down projections favor ND on 910B: physical transpose selects
+    // a slower tiling. Keep logical weights and quantization unchanged.
+    #[cfg(feature = "910b-fusions")]
+    if weight.dtype() == DType::BF16 && weight.shape().dims() == [16384, 2048] {
+        return Ok(crate::acl_tensor::AclTensor::from_device(
+            device_ptr(weight)?, weight.shape(), weight.dtype(),
+        ));
+    }
     #[cfg(feature = "910b-fusions")]
     if let Some(version) =
         version.filter(|_| weight.dtype() == DType::BF16 && weight.shape().dims().len() == 2)

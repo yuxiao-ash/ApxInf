@@ -22,7 +22,8 @@ With `910b-fusions`, explicitly immutable I8 weights can be packed into
 FRACTAL_NZ `[N/32,K/16,16,32]` storage for M >= 128, K divisible by 16
 and N divisible by 32. Logical `[K,N]` codes and channel scales are unchanged.
 Small, unaligned or mutable weights retain ND. BF16 immutable weights retain
-the physical transpose path, with NZ `[N/16,K/16,16,16]` selected for the
+the physical transpose path, except `[K,N]=[16384,2048]` down projections
+which retain ND after 910B layout measurements, with NZ `[N/16,K/16,16,16]` selected for the
 validated K=1152/M>=128 and K=2048,N=1024/M<=64 shapes (aligned K/N).
 Two-dimensional floating GEMM uses ACLNN Mm with FP32 accumulation.
 
