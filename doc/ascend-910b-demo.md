@@ -99,3 +99,7 @@ the performance gate; retaining ND for large BF16 down weights fixed it.
 Raw profiles and extracted per-op/per-shape CSVs are retained privately under
 `devlocal/pi05-910b-demo/`. INT8 performance acceptance is deferred; final
 performance/profiling evidence here is BF16.
+
+An additional100-sample BF16 repeat measured53.499305ms /65.410200ms
+(two/three views), both below the corresponding IB primary run. Actions were
+byte-identical to the primary ApxInf outputs.
