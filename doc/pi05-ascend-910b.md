@@ -10,9 +10,11 @@ The enabled path uses:
 - model-owned, precomputed timestep modulation for the configured Euler schedule;
 - context-owned physical `[N,K]` copies of explicitly immutable BF16 GEMM weights,
   exposed to ACLNN as logical `[K,N]` strided descriptors;
-- ACLNN AddLayerNorm for vision residual normalization and SplitWithSize for QKV;
+- ACLNN AddLayerNorm for vision residual normalization; biased/unsupported QKV
+  uses the fork's slice fallback (its stack reports SplitWithSize capture failures);
 - handwritten AscendC QKV/RoPE, AdaRMS and gate/residual fusion, behind the
-  existing safe backend operations. Attention, GEMM and GeGLU remain ACLNN.
+  existing safe backend operations. Attention and GEMM remain ACLNN; bounded
+  GeGLU shapes use the single-output native kernel described below.
 
 The custom kernels are local implementations, not copied partner kernels.
 AdaRMS and gate/residual specialize BF16 width 1024; QKV/RoPE specializes HALF
