@@ -81,3 +81,21 @@ and aligned whole-model numerical/performance checks.
 
 Generated logs, fixtures, raw profiles and extracted CSVs remain ignored under
 `devlocal/pi05-910b-demo/`; checkpoints/reference repos are reused in place.
+
+## BF16 measurements on the demo branch
+
+On 910B4-1 / CANN9.0.0, Euler10 with183 valid tokens and fixed RGB/noise:
+
+| Views | ApxInf model ms | IB Robot model ms | Latency reduction |
+| --- | ---: | ---: | ---: |
+| 2 | 53.827643 | 59.135816 | 8.976% |
+| 3 | 65.474431 | 66.981402 | 2.250% |
+
+These are10-warmup/100-sample synchronized model measurements with serialized
+device jobs. Both whole-output numerical gates passed (cosine≥.999,relL2≤.05,
+maxabs≤.05). All four final profiles contain three complete stable graph
+replays and match their own unprofiled outputs. The first3view round failed
+the performance gate; retaining ND for large BF16 down weights fixed it.
+Raw profiles and extracted per-op/per-shape CSVs are retained privately under
+`devlocal/pi05-910b-demo/`. INT8 performance acceptance is deferred; final
+performance/profiling evidence here is BF16.
