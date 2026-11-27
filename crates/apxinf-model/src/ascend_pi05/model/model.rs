@@ -1,7 +1,7 @@
-//! Construction and typed dispatch of loaded PI0.5 computation (Ascend, BF16).
+//! Construction and typed dispatch of loaded PI0.5 computation (Ascend, BF16 residuals and selective INT8).
 use super::blocks::{Bf16Blocks, L3Policies};
-use super::Pi05Model;
 use super::Bf16Model;
+use super::Pi05Model;
 use crate::ascend_pi05::backend::{self, Context};
 use crate::ascend_pi05::weights::Bf16Weights;
 use crate::ascend_pi05::{sinusoidal_time_embedding, Pi05Config};
@@ -27,10 +27,7 @@ pub(in crate::ascend_pi05) fn build_bf16_model_with_policies(
     )?)))
 }
 
-pub fn upload_time_embeddings_bf16(
-    config: &Pi05Config,
-    context: &Context,
-) -> Result<Vec<Tensor>> {
+pub fn upload_time_embeddings_bf16(config: &Pi05Config, context: &Context) -> Result<Vec<Tensor>> {
     (0..config.num_flow_steps)
         .map(|step| {
             let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
@@ -43,10 +40,10 @@ pub fn upload_time_embeddings_bf16(
             .into_iter()
             .map(half::bf16::from_f32)
             .collect::<Vec<_>>();
-            backend::to_device(context, &Tensor::from_bf16(
-                vec![1, config.action_expert.width],
-                &values,
-            )?)
+            backend::to_device(
+                context,
+                &Tensor::from_bf16(vec![1, config.action_expert.width], &values)?,
+            )
         })
         .collect()
 }
@@ -60,18 +57,23 @@ pub(in crate::ascend_pi05) enum ModelVariant {
         model: Bf16Model,
         time_embeddings: Arc<Vec<Tensor>>,
     },
+    Int8Dynamic {
+        model: Bf16Model,
+        time_embeddings: Arc<Vec<Tensor>>,
+    },
 }
 
 impl ModelVariant {
     pub(in crate::ascend_pi05) fn name(&self) -> &'static str {
         match self {
             Self::Bf16 { .. } => "bf16",
+            Self::Int8Dynamic { .. } => "int8_dynamic",
         }
     }
 
     pub(in crate::ascend_pi05) fn input_dtype(&self) -> DType {
         match self {
-            Self::Bf16 { .. } => DType::BF16,
+            Self::Bf16 { .. } | Self::Int8Dynamic { .. } => DType::BF16,
         }
     }
 
@@ -84,7 +86,9 @@ impl ModelVariant {
         token_count: usize,
     ) -> Result<super::WorkspaceRequirements> {
         match self {
-            Self::Bf16 { model, .. } => model.workspace_requirements(token_count),
+            Self::Bf16 { model, .. } | Self::Int8Dynamic { model, .. } => {
+                model.workspace_requirements(token_count)
+            }
         }
     }
 
@@ -101,7 +105,18 @@ impl ModelVariant {
             Self::Bf16 {
                 model,
                 time_embeddings,
-            } => model.infer(patches, token_ids, token_count, noise, time_embeddings, position_offset),
+            }
+            | Self::Int8Dynamic {
+                model,
+                time_embeddings,
+            } => model.infer(
+                patches,
+                token_ids,
+                token_count,
+                noise,
+                time_embeddings,
+                position_offset,
+            ),
         }
     }
     pub(in crate::ascend_pi05) fn infer_with_dump(
@@ -116,7 +131,18 @@ impl ModelVariant {
             Self::Bf16 {
                 model,
                 time_embeddings,
-            } => model.infer_with_dump(patches, token_ids, token_count, noise, time_embeddings, position_offset),
+            }
+            | Self::Int8Dynamic {
+                model,
+                time_embeddings,
+            } => model.infer_with_dump(
+                patches,
+                token_ids,
+                token_count,
+                noise,
+                time_embeddings,
+                position_offset,
+            ),
         }
     }
 
@@ -126,6 +152,10 @@ impl ModelVariant {
     ) -> Result<O::Output> {
         match self {
             Self::Bf16 {
+                model,
+                time_embeddings,
+            }
+            | Self::Int8Dynamic {
                 model,
                 time_embeddings,
             } => operation.run(model, time_embeddings),
@@ -142,7 +172,9 @@ impl ModelVariant {
     ) -> Result<()> {
         use super::PrepareBlocks;
         match self {
-            Self::Bf16 { model, .. } => model.blocks.preprocess(images, patches, layout),
+            Self::Bf16 { model, .. } | Self::Int8Dynamic { model, .. } => {
+                model.blocks.preprocess(images, patches, layout)
+            }
         }
     }
     pub(in crate::ascend_pi05) fn calibrate(
@@ -157,9 +189,11 @@ impl ModelVariant {
                 model,
                 time_embeddings,
             } => model.calibrate(patches, tokens, count, noise, time_embeddings),
+            _ => Err(Error::Other(
+                "PI0.5 calibration requires model_variant=bf16".into(),
+            )),
         }
     }
-
     // ── Iteration 7: out-of-graph pre-computed modulation ──────────────────
     //
     // The modulation chain (conditioning + fold gemms + slice/adds) is moved
@@ -181,10 +215,13 @@ impl ModelVariant {
             Self::Bf16 {
                 model,
                 time_embeddings,
-            } => model
-                .blocks
-                .prepare_all_modulation_materialized(time_embeddings)
-                .map(PreparedModulation::Bf16),
+            } | Self::Int8Dynamic { model, time_embeddings } => {
+                #[cfg(feature = "ascend-910b-fusions")]
+                let result = model.prepare_all_modulation(time_embeddings);
+                #[cfg(not(feature = "ascend-910b-fusions"))]
+                let result = model.blocks.prepare_all_modulation_materialized(time_embeddings);
+                result.map(PreparedModulation::Bf16)
+            },
         }
     }
 
@@ -203,7 +240,7 @@ impl ModelVariant {
         position_offset: Option<usize>,
     ) -> Result<Tensor> {
         match self {
-            Self::Bf16 { model, .. } => {
+            Self::Bf16 { model, .. } | Self::Int8Dynamic { model, .. } => {
                 let PreparedModulation::Bf16(modulation) = modulation;
                 model.infer_with_modulation(patches, token_ids, token_count, noise, modulation, position_offset)
             }
@@ -218,6 +255,7 @@ impl ModelVariant {
 pub(in crate::ascend_pi05) enum PreparedModulation {
     Bf16(Vec<super::blocks::bf16::backbone::Bf16StepModulation>),
 }
+
 
 /// Internal static-dispatch seam.
 pub(in crate::ascend_pi05) trait ModelOperation {

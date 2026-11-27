@@ -1,31 +1,20 @@
-//! BF16 blocks for PI0.5 (Ascend).
+//! Native-BF16 π0.5 transformer-layer computation (Ascend NPU).
 //!
-//! The residual+norm helpers use fused aclnn ops so the op distribution matches
-//! the torch_npu execution plan:
-//!
-//! - "aclnnInplaceAddRmsNorm" (1 op) replaces "aclnnInplaceAdd" +
-//!   "aclnnAddRmsNorm" (2 ops) in the post-attention / post-MLP path.
-//! - "aclnnAddLayerNorm" (1 op) replaces "aclnnAdd" + "aclnnLayerNorm"
-//!   (2 ops) in the vision-encoder residual path.
-//!
-//! Every other op (attention, rope, split, pointwise silu/mul, gemm, geglu)
-//! runs through the common L3 op layer.
+//! Identical logic to `pi05::model::blocks::bf16` — only the backend import
+//! and error variant differ.
 
 use crate::ascend_pi05::backend::{
     ops::{
-        attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
-        adaptive_rms_norm as l3_adaptive_rms_norm, bias_residual as l3_bias_residual,
-        add_layer_norm as l3_add_layer_norm,
-        bias_residual_layer_norm as l3_bias_residual_layer_norm,
-        inplace_add_rms_norm_zero_copy as l3_inplace_add_rms_norm_zero_copy,
-        bias_residual_rms_norm as l3_bias_residual_rms_norm, gemm as l3_gemm,
-        gemm_bias as l3_gemm_bias, gemm_geglu as l3_gemm_geglu, layer_norm as l3_layer_norm,
-        pointwise as l3_pointwise, rms_norm as l3_rms_norm,
-        reserve_prefix as l3_reserve_prefix, rope as l3_rope, AttentionArgs, GatherArgs,
-        AdaptiveRmsNormArgs, AddLayerNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic,
-        GemmArgs, GemmBiasArgs, GemmGegluArgs, LayerNormArgs, PointwiseActivation,
-        PointwiseArgs, PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic, WeightVersion,
+        adaptive_rms_norm as l3_adaptive_rms_norm, attention as l3_attention,
+        bias_residual as l3_bias_residual, bias_residual_layer_norm as l3_bias_residual_layer_norm,
+        bias_residual_rms_norm as l3_bias_residual_rms_norm, concat_rows as l3_concat_rows,
+        gather as l3_gather, gemm as l3_gemm, gemm_geglu as l3_gemm_geglu,
+        layer_norm as l3_layer_norm, pointwise as l3_pointwise,
+        reserve_prefix as l3_reserve_prefix, rms_norm as l3_rms_norm, rope as l3_rope,
+        AdaptiveRmsNormArgs, AttentionArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
+        BiasResidualRmsNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic, GemmArgs,
+        GemmGegluArgs, LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
+        RmsNormArgs, RopeArgs, RopeSemantic, WeightVersion,
     },
     Context, DeviceBuffer,
 };
@@ -99,82 +88,6 @@ fn rms_bf16(ctx: &Context, input: &Tensor, weight: &Tensor, eps: f32) -> Result<
     Ok(output)
 }
 
-/// Extract raw device pointer from a tensor (for direct aclnn FFI calls).
-fn device_ptr_2d(tensor: &Tensor) -> usize {
-    match tensor.storage() {
-        apxinf_core::Storage::Gpu { handle, .. } => handle.ptr(),
-        _ => 0,
-    }
-}
-
-/// Element-wise mul: `out = a * b` via `aclnnMul`.
-/// Matches torch_npu graph `Mul` op for gate multiplication.
-fn mul_bf16(ctx: &Context, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let out = ctx.allocate_output(a.shape().clone(), DType::BF16)?;
-    let b_shape = b.shape();
-    let b_reshaped = if b_shape.dims().len() == 1 && a.shape().dims().len() == 2 {
-        b.reshape(Shape::new(vec![1, b_shape.dims()[0]]))?
-    } else {
-        b.clone()
-    };
-    crate::ascend_pi05::backend::ops::aclnn_mul(
-        device_ptr_2d(a),
-        device_ptr_2d(&b_reshaped),
-        device_ptr_2d(&out),
-        a.shape(),
-        b_reshaped.shape(),
-        DType::BF16,
-        ctx.raw_stream(),
-    )?;
-    Ok(out)
-}
-
-/// Gelu (tanh approximation): `out = gelu(input)` via `aclnnGelu`.
-/// Matches torch_npu graph `Gelu` op for MLP activation.
-fn gelu_bf16(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    let out = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    crate::ascend_pi05::backend::ops::aclnn_gelu(
-        device_ptr_2d(input),
-        device_ptr_2d(&out),
-        input.shape(),
-        DType::BF16,
-        ctx.raw_stream(),
-    )?;
-    Ok(out)
-}
-
-/// Element-wise add: `out = a + alpha * b` via `aclnnAdd`.
-/// Matches torch_npu graph `Add` op for residual addition.
-fn add_bf16(ctx: &Context, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let out = ctx.allocate_output(a.shape().clone(), DType::BF16)?;
-    crate::ascend_pi05::backend::ops::aclnn_add(
-        device_ptr_2d(a),
-        device_ptr_2d(b),
-        device_ptr_2d(&out),
-        a.shape(),
-        b.shape(),
-        1.0,
-        DType::BF16,
-        ctx.raw_stream(),
-    )?;
-    Ok(out)
-}
-
-/// Scalar mul: `out = input * scalar` via `aclnnMuls`.
-/// Matches torch_npu graph `Muls` op for velocity * dt in euler update.
-fn muls_bf16(ctx: &Context, input: &Tensor, scalar: f32) -> Result<Tensor> {
-    let out = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    crate::ascend_pi05::backend::ops::aclnn_muls(
-        device_ptr_2d(input),
-        device_ptr_2d(&out),
-        input.shape(),
-        scalar,
-        DType::BF16,
-        ctx.raw_stream(),
-    )?;
-    Ok(out)
-}
-
 fn layer_bf16(
     ctx: &Context,
     input: &Tensor,
@@ -190,12 +103,7 @@ fn layer_bf16(
     Ok(output)
 }
 
-fn adaptive_rms_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    style: &Tensor,
-    eps: f32,
-) -> Result<Tensor> {
+fn adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32) -> Result<Tensor> {
     let cols = input
         .shape()
         .dims()
@@ -225,16 +133,13 @@ fn bias_activation_bf16(
     Ok(output)
 }
 
-fn euler_update_bf16(
-    ctx: &Context,
-    state: &Tensor,
-    velocity: &Tensor,
-    dt: f32,
-) -> Result<Tensor> {
-    // torch_npu graph: Muls(velocity, dt) -> Add(state, scaled_vel).
-    // Split into 2 ops to match graph op sequence (no fused EulerUpdate).
-    let scaled = muls_bf16(ctx, velocity, dt)?;
-    add_bf16(ctx, state, &scaled)
+fn euler_update_bf16(ctx: &Context, state: &Tensor, velocity: &Tensor, dt: f32) -> Result<Tensor> {
+    let mut output = ctx.allocate_output(state.shape().clone(), DType::BF16)?;
+    let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, state, &mut output);
+    args.secondary = Some(velocity);
+    args.dt = dt;
+    l3_pointwise(ctx, args)?;
+    Ok(output)
 }
 
 fn add_position_bf16(
@@ -257,8 +162,12 @@ fn gemm_bf16(
     ctx: &Context,
     policies: &L3Policies,
     activation: &Tensor,
-    weight: &Tensor,
+    linear: &Bf16LinearWeights,
 ) -> Result<Tensor> {
+    if linear.channel_scales.is_some() {
+        return super::int8_dynamic::project(ctx, policies, activation, linear, false);
+    }
+    let weight = &linear.weight;
     let a = activation.shape().dims();
     let b = weight.shape().dims();
     if activation.dtype() != DType::BF16
@@ -274,78 +183,10 @@ fn gemm_bf16(
         )));
     }
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
-    let mut args = GemmArgs::new(activation, weight, &mut output);
+    let mut args =
+        GemmArgs::new(activation, weight, &mut output).with_immutable_weight(WeightVersion::new(1));
     args.policy = policies.gemm.clone();
     l3_gemm(ctx, args)?;
-    Ok(output)
-}
-
-/// Plain GEMM forced through `aclnnMatmul` (MatMulV3), regardless of
-/// `policies.gemm`. Used by the batched fold gemms (M = num_flow_steps) where
-/// `aclnnFusedMatmul` measured only 13-22% MAC utilization vs 94% for the
-/// `aclnnMatmul` path on comparable shapes. Pure matmul — no bias/activation
-/// fusion — so the numerics are the same BF16 matmul as `gemm_bf16`
-/// (bitwise-verified against the FusedMatmul path where applicable).
-fn gemm_bf16_matmul(
-    ctx: &Context,
-    activation: &Tensor,
-    weight: &Tensor,
-) -> Result<Tensor> {
-    let a = activation.shape().dims();
-    let b = weight.shape().dims();
-    if activation.dtype() != DType::BF16
-        || weight.dtype() != DType::BF16
-        || a.len() != 2
-        || b.len() != 2
-        || a[1] != b[0]
-    {
-        return Err(Error::Other(format!(
-            "PI0.5 BF16 GEMM(MatMulV3) shape/dtype mismatch: {} {a:?} @ {} {b:?}",
-            activation.dtype(),
-            weight.dtype()
-        )));
-    }
-    let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
-    let mut args = GemmArgs::new(activation, weight, &mut output);
-    // Force the MatMulV3 implementation for this call regardless of policy.
-    args.policy.impl_preference = crate::ascend_pi05::backend::ops::GemmImpl::AclnnMatmul;
-    l3_gemm(ctx, args)?;
-    Ok(output)
-}
-
-/// Fused GEMM + bias: `out = activation @ weight + bias`.
-///
-/// Under `AclnnFusedMatmul` policy, bias is fused into the matmul kernel
-/// (1 launch instead of matmul + aclnnAdd). Falls back to 2-launch
-/// `aclnnMatmul + aclnnAdd` under `AclnnMatmul` policy.
-fn gemm_bias_bf16(
-    ctx: &Context,
-    policies: &L3Policies,
-    activation: &Tensor,
-    weight: &Tensor,
-    bias: &Tensor,
-) -> Result<Tensor> {
-    let a = activation.shape().dims();
-    let b = weight.shape().dims();
-    if activation.dtype() != DType::BF16
-        || weight.dtype() != DType::BF16
-        || bias.dtype() != DType::BF16
-        || a.len() != 2
-        || b.len() != 2
-        || a[1] != b[0]
-    {
-        return Err(Error::Other(format!(
-            "PI0.5 BF16 GEMM+bias shape/dtype mismatch: {} {a:?} @ {} {b:?} + {} {:?}",
-            activation.dtype(),
-            weight.dtype(),
-            bias.dtype(),
-            bias.shape().dims()
-        )));
-    }
-    let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
-    let mut gemm = GemmArgs::new(activation, weight, &mut output);
-    gemm.policy = policies.gemm.clone();
-    l3_gemm_bias(ctx, GemmBiasArgs { gemm, bias })?;
     Ok(output)
 }
 
@@ -353,8 +194,12 @@ fn gemm_geglu_bf16(
     ctx: &Context,
     policies: &L3Policies,
     activation: &Tensor,
-    canonical_weight: &Tensor,
+    linear: &Bf16LinearWeights,
 ) -> Result<Tensor> {
+    if linear.channel_scales.is_some() {
+        return super::int8_dynamic::project(ctx, policies, activation, linear, true);
+    }
+    let canonical_weight = &linear.weight;
     let a = activation.shape().dims();
     let b = canonical_weight.shape().dims();
     if activation.dtype() != DType::BF16
@@ -413,19 +258,13 @@ fn mqa_bf16(
     let key = DeviceBuffer::from_tensor(key)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(|e| Error::Other(format!("MQA key view: {e}")))?;
     let value = DeviceBuffer::from_tensor(value)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(|e| Error::Other(format!("MQA value view: {e}")))?;
     let query4 = query.reshape(Shape::new(vec![1, q[0], q[1], q[2]]))?;
@@ -476,17 +315,11 @@ fn split_qkv_bias_bf16(
     head_dim: usize,
 ) -> Result<QkvTensors> {
     let shape = qkv.shape().dims();
-    if qkv.dtype() != DType::BF16
-        || shape.len() != 2
-        || shape[1] != 3 * heads * head_dim
-    {
+    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != 3 * heads * head_dim {
         return Err(Error::Other(
             "PI0.5 BF16 vision QKV shape/dtype mismatch".into(),
         ));
     }
-    // A2 (iter8) tried binding q/k/v as zero-copy QKV views to drop the 3
-    // split copies — it corrupted numerics + caused kernel timeouts under RI
-    // capture, so the independent-buffer + aclnnSlice path is restored.
     let output_shape = Shape::new(vec![shape[0], heads, head_dim]);
     let mut q = ctx.allocate_output(output_shape.clone(), DType::BF16)?;
     let mut k = ctx.allocate_output(output_shape.clone(), DType::BF16)?;
@@ -531,12 +364,7 @@ fn split_qkv_rope_bf16(
             "PI0.5 BF16 rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    // Restored: independent q/k/v buffers filled via aclnnSlice (A2 views were
-    // numerically corrupt + caused kernel timeouts under RI capture).
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
     let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
     let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
@@ -583,12 +411,7 @@ fn split_qkv_rope_into_cache_bf16(
             "PI0.5 BF16 cached rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    // Restored: independent q buffer; k/v via aclnnSlice into the persistent
-    // cache at cache_offset (A2 views were numerically corrupt under RI capture).
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let mut key_cache = key_cache.clone();
     let mut value_cache = value_cache.clone();
     l3_rope(
@@ -635,12 +458,6 @@ fn bias_residual_bf16(
     Ok(hidden)
 }
 
-/// Unfused bias + residual + RMS norm (fallback path).
-///
-/// The fused path uses `gemm_bias_bf16` + `inplace_add_rms_bf16` instead.
-/// Kept as a fallback for callers where bias cannot be fused into the GEMM
-/// (e.g. when the projection comes from a non-GEMM source).
-#[allow(dead_code)]
 fn bias_residual_rms_bf16(
     ctx: &Context,
     projection: &Tensor,
@@ -666,44 +483,6 @@ fn bias_residual_rms_bf16(
     Ok(ResidualNormTensors { hidden, normalized })
 }
 
-/// Fused residual + RMS norm via `aclnnInplaceAddRmsNorm`.
-///
-/// `projection_with_bias` is modified in place: `projection_with_bias += residual`.
-/// Then `normalized = rms_norm(projection_with_bias, weight)`.
-///
-/// Replaces the 2-op path (`aclnnAddRmsNorm` which already fused add+norm
-/// but needs a separate bias-add before it) when used together with
-/// `gemm_bias_bf16`: `gemm_bias` (1 op, bias fused into matmul) +
-/// `inplace_add_rms_bf16` (1 op) = 2 ops total, vs the original 3 ops
-/// (matmul + inplace_add bias + AddRmsNorm).
-///
-/// Zero-copy variant: `projection_with_bias` becomes `normalized` (x1Ref is
-/// overwritten in place by the operator), and `residual` becomes `hidden`
-/// (x2Ref is overwritten with the residual sum). No `aclnnInplaceCopy` (d2d)
-/// ops are emitted — saves ~754 d2d ops per inference vs the legacy wrapper.
-///
-/// Callers MUST NOT read `residual` after this call (its device memory is
-/// overwritten). All current call sites satisfy this: `residual` is either
-/// `input` (last use) or `&fused.hidden` (moved into the new `fused`).
-fn inplace_add_rms_bf16(
-    ctx: &Context,
-    projection_with_bias: Tensor,
-    residual: &Tensor,
-    weight: &Tensor,
-    eps: f32,
-) -> Result<ResidualNormTensors> {
-    // x2 clone is zero-copy (Arc refcount on GpuStorageHandle).
-    let x2_owned = residual.clone();
-    let (normalized, hidden) = l3_inplace_add_rms_norm_zero_copy(
-        ctx,
-        projection_with_bias,
-        x2_owned,
-        weight,
-        eps,
-    )?;
-    Ok(ResidualNormTensors { hidden, normalized })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn bias_residual_layer_bf16(
     ctx: &Context,
@@ -714,10 +493,6 @@ fn bias_residual_layer_bf16(
     norm_bias: &Tensor,
     eps: f32,
 ) -> Result<ResidualNormTensors> {
-    // Fused path: hidden = projection + projection_bias + residual via the
-    // existing bias_residual helper, then layer_norm. The aclnnAddLayerNorm
-    // fusion is not applicable here because bias_residual already performed
-    // the add; a separate layer_norm op is correct and graph-safe.
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     l3_bias_residual_layer_norm(
@@ -732,38 +507,6 @@ fn bias_residual_layer_bf16(
             &mut normalized,
             eps,
         ),
-    )?;
-    Ok(ResidualNormTensors { hidden, normalized })
-}
-
-/// Fused add + layer norm via `aclnnAddLayerNorm`.
-///
-/// `hidden = projection + residual; normalized = layer_norm(hidden, weight, bias)`.
-/// Single op (1 kernel launch) replaces the 3-op `bias_residual_layer_bf16`
-/// (add + inplace_add + layer_norm). Requires projection bias to be fused
-/// into the upstream GEMM via `gemm_bias_bf16`.
-fn add_layer_norm_bf16(
-    ctx: &Context,
-    projection: &Tensor,
-    residual: &Tensor,
-    norm_weight: &Tensor,
-    norm_bias: &Tensor,
-    eps: f32,
-) -> Result<ResidualNormTensors> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_add_layer_norm(
-        ctx,
-        AddLayerNormArgs {
-            x1: projection,
-            x2: residual,
-            weight: norm_weight,
-            bias: norm_bias,
-            norm_bias: None,
-            normalized: &mut normalized,
-            hidden: Some(&mut hidden),
-            eps,
-        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -837,7 +580,7 @@ fn language_layer_bf16_with_policies(
     rope_theta: f32,
 ) -> Result<Bf16LanguageLayerOutput> {
     let normalized = rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
-    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
+    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv)?;
     let qkv = split_qkv_rope_bf16(
         ctx,
         &qkv,
@@ -858,30 +601,18 @@ fn language_layer_bf16_with_policies(
     }
     let attention = mqa_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
-    // Fused path: gemm_bias (1 op, bias fused into matmul) +
-    // inplace_add_rms (1 op) = 2 ops vs original 3 ops
-    // (matmul + inplace_add bias + AddRmsNorm).
-    let projected = match weights.output.bias.as_ref() {
-        Some(bias) => gemm_bias_bf16(ctx, policies, &attention, &weights.output.weight, bias)?,
-        None => gemm_bf16(ctx, policies, &attention, &weights.output.weight)?,
-    };
-    let fused = inplace_add_rms_bf16(
+    let projected = gemm_bf16(ctx, policies, &attention, &weights.output)?;
+    let fused = bias_residual_rms_bf16(
         ctx,
-        projected,
+        &projected,
+        weights.output.bias.as_ref(),
         input,
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
-    // Fused path: gemm_bias (1 op) + bias_residual without bias (1 op,
-    // just residual add) = 2 ops vs original 3 ops (matmul + bias add +
-    // residual add). The down projection bias is fused into gemm_bias; the
-    // residual add is a plain aclnnAdd (no norm here).
-    let projected = match weights.down.bias.as_ref() {
-        Some(bias) => gemm_bias_bf16(ctx, policies, &activated, &weights.down.weight, bias)?,
-        None => gemm_bf16(ctx, policies, &activated, &weights.down.weight)?,
-    };
-    let hidden = bias_residual_bf16(ctx, &projected, None, &fused.hidden)?;
+    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
+    let projected = gemm_bf16(ctx, policies, &activated, &weights.down)?;
+    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -896,16 +627,9 @@ pub fn action_layer_bf16(
     weights: &Bf16DeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
-    attention_scale_weight: &Tensor,
-    attention_gate: &Tensor,
-    post_attention_scale_weight: &Tensor,
-    mlp_gate: &Tensor,
-    next_scale_weight: &Tensor,
-    qkv_bias: &Tensor,
-    gate_proj_bias: &Tensor,
-    up_proj_bias: &Tensor,
-    gate_weight: &Tensor,
-    up_weight: &Tensor,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
     prefix_k: &Tensor,
     prefix_v: &Tensor,
     position_offset: usize,
@@ -921,16 +645,9 @@ pub fn action_layer_bf16(
         weights,
         input,
         attention_normalized,
-        attention_scale_weight,
-        attention_gate,
-        post_attention_scale_weight,
-        mlp_gate,
-        next_scale_weight,
-        qkv_bias,
-        gate_proj_bias,
-        up_proj_bias,
-        gate_weight,
-        up_weight,
+        attention_modulation,
+        mlp_modulation,
+        next_norm_modulation,
         prefix_k,
         prefix_v,
         position_offset,
@@ -941,18 +658,6 @@ pub fn action_layer_bf16(
     )
 }
 
-/// Action layer matching torch_npu 31ms graph op sequence:
-/// 1. RmsNorm(x, scale_weight) — first block only; later blocks reuse
-///    previous block's InplaceAddRmsNorm normalized output
-/// 2. MatMul(QKV) + bias (shift folded)
-/// 3. SplitV → ApplyRotaryPosEmb → FAS (cross-attn)
-/// 4. MatMul(output proj)
-/// 5. Mul(attn_out, gate) — _gated_residual
-/// 6. InplaceAddRmsNorm(scaled, residual, post_scale_weight) → hidden + normed
-/// 7. MatMul(gate_proj) + bias → Gelu → MatMul(up_proj) + bias → Mul(gelu, up)
-/// 8. MatMul(down_proj)
-/// 9. Mul(mlp_out, gate) — _gated_residual
-/// 10. InplaceAddRmsNorm(scaled, residual, next_scale_weight) → hidden + next_normed
 #[allow(clippy::too_many_arguments)]
 fn action_layer_bf16_with_policies(
     ctx: &Context,
@@ -961,16 +666,9 @@ fn action_layer_bf16_with_policies(
     weights: &Bf16DeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
-    attention_scale_weight: &Tensor,
-    attention_gate: &Tensor,
-    post_attention_scale_weight: &Tensor,
-    mlp_gate: &Tensor,
-    next_scale_weight: &Tensor,
-    qkv_bias: &Tensor,
-    gate_proj_bias: &Tensor,
-    up_proj_bias: &Tensor,
-    gate_weight: &Tensor,
-    up_weight: &Tensor,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
     prefix_k: &Tensor,
     prefix_v: &Tensor,
     position_offset: usize,
@@ -979,22 +677,15 @@ fn action_layer_bf16_with_policies(
     rms_eps: f32,
     rope_theta: f32,
 ) -> Result<Bf16ActionLayerOutput> {
-    // 1. Pre-attn norm: RmsNorm(x, scale_weight=1+scale)
-    //    For first block: RmsNorm(input, attention_scale_weight)
-    //    For later blocks: attention_normalized is already the normed output
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
-        None => rms_bf16(ctx, input, attention_scale_weight, rms_eps)?,
+        None => adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps)?,
     };
-
-    // 2. QKV GEMM with folded shift bias: MatMulV3(normed, qkv_weight, qkv_bias)
-    let qkv = gemm_bias_bf16(ctx, policies, &normalized, &weights.qkv.weight, qkv_bias)?;
-
-    // 3. Split QKV + RoPE into cache
+    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv)?;
     let q = split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
-        None, // bias already folded into qkv_bias via gemm_bias
+        weights.qkv.bias.as_ref(),
         config.num_heads,
         config.num_kv_heads,
         config.head_dim,
@@ -1004,66 +695,30 @@ fn action_layer_bf16_with_policies(
         prefix_v,
         kv_cache_offset,
     )?;
-
-
-
-    // 4. Cross-attention via FAS
-    let attention = mqa_bf16(
+    let attention =
+        mqa_bf16(ctx, policies, &q, prefix_k, prefix_v, kv_key_count)?.reshape(vec![
+            input.shape().dims()[0],
+            config.num_heads * config.head_dim,
+        ])?;
+    let projected = gemm_bf16(ctx, policies, &attention, &weights.output)?;
+    let fused = adaptive_gate_residual_rms_bf16(
         ctx,
-        policies,
-        &q,
-        prefix_k,
-        prefix_v,
-        kv_key_count,
-    )?
-    .reshape(vec![
-        input.shape().dims()[0],
-        config.num_heads * config.head_dim,
-    ])?;
-
-    // 5. Output projection: MatMul(attn, output_weight)
-    let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
-
-    // 6. Mul(projected, attention_gate) — _gated_residual step 1
-    let gated = mul_bf16(ctx, &projected, attention_gate)?;
-
-    // 7. InplaceAddRmsNorm(gated, input, post_attention_scale_weight)
-    //    → hidden (residual), normalized (for MLP)
-    let fused = inplace_add_rms_bf16(
-        ctx,
-        gated,
+        &projected,
         input,
-        post_attention_scale_weight,
+        attention_modulation,
+        mlp_modulation,
         rms_eps,
     )?;
-
-
-    // 8. MLP: gate_proj + Gelu + up_proj + Mul + down_proj
-    //    MatMul(gate_proj) with folded shift bias
-    let gate_out = gemm_bias_bf16(ctx, policies, &fused.normalized, gate_weight, gate_proj_bias)?;
-    // Gelu(gate_out)
-    let gelu_out = gelu_bf16(ctx, &gate_out)?;
-    // MatMul(up_proj) with folded shift bias
-    let up_out = gemm_bias_bf16(ctx, policies, &fused.normalized, up_weight, up_proj_bias)?;
-    // Mul(gelu(gate), up)
-    let activated = mul_bf16(ctx, &gelu_out, &up_out)?;
-    // MatMul(down_proj)
-    let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
-
-    // 9. Mul(projected, mlp_gate) — _gated_residual step 2
-    let gated = mul_bf16(ctx, &projected, mlp_gate)?;
-
-    // 10. InplaceAddRmsNorm(gated, fused.hidden, next_scale_weight)
-    //     → hidden (residual), next_normalized (for next layer)
-    let fused = inplace_add_rms_bf16(
+    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
+    let projected = gemm_bf16(ctx, policies, &activated, &weights.down)?;
+    let fused = adaptive_gate_residual_rms_bf16(
         ctx,
-        gated,
+        &projected,
         &fused.hidden,
-        next_scale_weight,
+        mlp_modulation,
+        next_norm_modulation,
         rms_eps,
     )?;
-
-
     Ok(Bf16ActionLayerOutput {
         hidden: fused.hidden,
         next_normalized: fused.normalized,
@@ -1081,16 +736,9 @@ fn action_layer_bf16_with_policies_dump(
     weights: &Bf16DeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
-    attention_scale_weight: &Tensor,
-    attention_gate: &Tensor,
-    post_attention_scale_weight: &Tensor,
-    mlp_gate: &Tensor,
-    next_scale_weight: &Tensor,
-    qkv_bias: &Tensor,
-    gate_proj_bias: &Tensor,
-    up_proj_bias: &Tensor,
-    gate_weight: &Tensor,
-    up_weight: &Tensor,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
     prefix_k: &Tensor,
     prefix_v: &Tensor,
     position_offset: usize,
@@ -1101,15 +749,13 @@ fn action_layer_bf16_with_policies_dump(
 ) -> Result<(Bf16ActionLayerOutput, Bf16ActionLayerInternals)> {
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
-        None => rms_bf16(ctx, input, attention_scale_weight, rms_eps)?,
+        None => adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps)?,
     };
-    let normalized_capture = normalized.clone();
-    let qkv = gemm_bias_bf16(ctx, policies, &normalized, &weights.qkv.weight, qkv_bias)?;
-    let qkv_capture = qkv.clone();
+    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv)?;
     let q = split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
-        None,
+        weights.qkv.bias.as_ref(),
         config.num_heads,
         config.num_kv_heads,
         config.head_dim,
@@ -1119,50 +765,41 @@ fn action_layer_bf16_with_policies_dump(
         prefix_v,
         kv_cache_offset,
     )?;
+    // Capture K and V from the prefix cache (post-RoPE for K).
     let seq_len = input.shape().dims()[0];
     let kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
     let k_post_rope = slice_kv_rows_bf16(prefix_k, kv_cache_offset, seq_len, kv_heads, head_dim)?;
     let v = slice_kv_rows_bf16(prefix_v, kv_cache_offset, seq_len, kv_heads, head_dim)?;
-    let attention = mqa_bf16(
-        ctx,
-        policies,
-        &q,
-        prefix_k,
-        prefix_v,
-        kv_key_count,
-    )?
-    .reshape(vec![
-        input.shape().dims()[0],
-        config.num_heads * config.head_dim,
-    ])?;
+    let attention =
+        mqa_bf16(ctx, policies, &q, prefix_k, prefix_v, kv_key_count)?.reshape(vec![
+            input.shape().dims()[0],
+            config.num_heads * config.head_dim,
+        ])?;
     let q_post_rope = q.clone();
     let attn_out = attention.clone();
-    let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
+    let projected = gemm_bf16(ctx, policies, &attention, &weights.output)?;
     let attn_proj = projected.clone();
-    let gated = mul_bf16(ctx, &projected, attention_gate)?;
-    let fused = inplace_add_rms_bf16(
+    let fused = adaptive_gate_residual_rms_bf16(
         ctx,
-        gated,
+        &projected,
         input,
-        post_attention_scale_weight,
+        attention_modulation,
+        mlp_modulation,
         rms_eps,
     )?;
     let post_attn_hidden = fused.hidden.clone();
     let post_attn_norm = fused.normalized.clone();
-    let gate_out = gemm_bias_bf16(ctx, policies, &fused.normalized, gate_weight, gate_proj_bias)?;
-    let gelu_out = gelu_bf16(ctx, &gate_out)?;
-    let up_out = gemm_bias_bf16(ctx, policies, &fused.normalized, up_weight, up_proj_bias)?;
-    let activated = mul_bf16(ctx, &gelu_out, &up_out)?;
+    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
     let geglu_out = activated.clone();
-    let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
+    let projected = gemm_bf16(ctx, policies, &activated, &weights.down)?;
     let mlp_proj = projected.clone();
-    let gated = mul_bf16(ctx, &projected, mlp_gate)?;
-    let fused = inplace_add_rms_bf16(
+    let fused = adaptive_gate_residual_rms_bf16(
         ctx,
-        gated,
+        &projected,
         &fused.hidden,
-        next_scale_weight,
+        mlp_modulation,
+        next_norm_modulation,
         rms_eps,
     )?;
     Ok((
@@ -1171,8 +808,8 @@ fn action_layer_bf16_with_policies_dump(
             next_normalized: fused.normalized.clone(),
         },
         Bf16ActionLayerInternals {
-            normalized: normalized_capture,
-            qkv: qkv_capture,
+            normalized,
+            qkv,
             q_post_rope,
             k_post_rope,
             v,
@@ -1222,10 +859,7 @@ fn slice_kv_rows_bf16(
     DeviceBuffer::from_tensor(cache)
         .and_then(|buffer| buffer.view(start_byte, bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![seq_len, kv_heads, head_dim]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![seq_len, kv_heads, head_dim]), DType::BF16)
         })
         .map_err(|e| Error::Other(format!("slice_kv_rows_bf16: {e}")))
 }
@@ -1255,7 +889,7 @@ fn vision_patch_embed_bf16_with_policies(
     patches: &Tensor,
     patches_per_view: usize,
 ) -> Result<Tensor> {
-    let projection = gemm_bf16(ctx, policies, patches, &weights.weight)?;
+    let projection = gemm_bf16(ctx, policies, patches, weights)?;
     add_position_bf16(
         ctx,
         &projection,
@@ -1305,21 +939,11 @@ fn vision_layer_bf16_with_policies(
         &weights.norm1.bias,
         layer_norm_eps,
     )?;
-    // NOTE(iter8, 2026-11-13): bias folded into gemm_bias epilogue (skill
-    // FUS-11) — this is an OPERATOR-IMPLEMENTATION change (gemm epilogue vs
-    // standalone bias add), so sha may legitimately vary (was 4a68de9c →
-    // fde93a1e, ULP-scale). Per the amended acceptance rule: verify passes
-    // (finite), then perf + libero-10 success-rate decide; NOT a hard sha ban.
-    let qkv = match weights.qkv.bias.as_ref() {
-        Some(bias) => gemm_bias_bf16(ctx, policies, &normalized, &weights.qkv.weight, bias)?,
-        None => gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?,
-    };
-    let qkv = split_qkv_bias_bf16(ctx, &qkv, None, heads, head_dim)?;
+    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv)?;
+    let qkv = split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
     let attention = mha_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
-    // Note: aclnnAddLayerNorm fusion attempted but produces NaN in graph
-    // capture mode. Using the 3-op bias_residual_layer path for now.
-    let projection = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
+    let projection = gemm_bf16(ctx, policies, &attention, &weights.output)?;
     let fused = bias_residual_layer_bf16(
         ctx,
         &projection,
@@ -1329,14 +953,14 @@ fn vision_layer_bf16_with_policies(
         &weights.norm2.bias,
         layer_norm_eps,
     )?;
-    let activation = gemm_bf16(ctx, policies, &fused.normalized, &weights.fc1.weight)?;
+    let activation = gemm_bf16(ctx, policies, &fused.normalized, &weights.fc1)?;
     let activation = bias_activation_bf16(
         ctx,
         &activation,
         weights.fc1.bias.as_ref(),
         PointwiseActivation::Gelu,
     )?;
-    let projection = gemm_bf16(ctx, policies, &activation, &weights.fc2.weight)?;
+    let projection = gemm_bf16(ctx, policies, &activation, &weights.fc2)?;
     bias_residual_bf16(ctx, &projection, weights.fc2.bias.as_ref(), &fused.hidden)
 }
 
@@ -1365,14 +989,6 @@ pub(in crate::ascend_pi05::model) mod backbone {
     use apxinf_core::{DType, Error, Result, Tensor};
     use std::sync::Arc;
 
-    /// Extract the raw device pointer from a tensor (for aclnn FFI calls).
-    fn device_ptr_of(tensor: &Tensor) -> usize {
-        match tensor.storage() {
-            apxinf_core::Storage::Gpu { handle, .. } => handle.ptr(),
-            _ => 0,
-        }
-    }
-
     pub struct Bf16PrefixKvCache {
         pub keys: Vec<Tensor>,
         pub values: Vec<Tensor>,
@@ -1384,38 +1000,15 @@ pub(in crate::ascend_pi05::model) mod backbone {
         pub position_offset: usize,
     }
 
-    /// Per-step modulation tables for the action expert, matching the
-    /// torch_npu 31ms graph layout.
-    ///
-    ///  (= 1 + scale) is the RmsNorm gamma.  is the
-    /// runtime element-wise gate.  is **not** stored here — it is
-    /// folded into the downstream Linear biases (, ,
-    /// , ) during precompute, eliminating the
-    /// runtime  op (matching torch_npu's
-    /// ).
+    #[derive(Clone)]
     pub struct Bf16StepModulation {
-        /// Per-layer pre-attn RmsNorm gamma = 1 + input_scale. [hidden]
-        pub attention_scale_weight: Vec<Tensor>,
-        /// Per-layer attn output gate. [hidden]
-        pub attention_gate: Vec<Tensor>,
-        /// Per-layer post-attn InplaceAddRmsNorm weight = 1 + post_scale. [hidden]
-        pub post_attention_scale_weight: Vec<Tensor>,
-        /// Per-layer MLP output gate. [hidden]
-        pub mlp_gate: Vec<Tensor>,
-        /// Final norm RmsNorm gamma = 1 + final_scale. [hidden]
-        pub final_norm_scale_weight: Tensor,
-        /// Per-layer QKV bias = qkv_weight^T @ input_shift (+ orig qkv bias).
-        /// Folded shift eliminates runtime Add(normed, shift).
-        pub qkv_bias: Vec<Tensor>,
-        /// Per-layer gate_proj bias = gate_weight^T @ post_shift.
-        pub gate_proj_bias: Vec<Tensor>,
-        /// Per-layer up_proj bias = up_weight^T @ post_shift.
-        pub up_proj_bias: Vec<Tensor>,
-        /// action_out bias = action_out_weight^T @ final_shift + orig bias.
-        pub action_out_bias: Tensor,
+        attention: Vec<Tensor>,
+        mlp: Vec<Tensor>,
+        final_norm: Tensor,
     }
 
     pub struct Bf16Blocks {
+        static_modulation: Option<Vec<Bf16StepModulation>>,
         pub(in crate::ascend_pi05::model) backend: Arc<Context>,
         pub(in crate::ascend_pi05::model) config: Arc<Pi05Config>,
         pub(in crate::ascend_pi05::model) weights: Arc<Bf16Weights>,
@@ -1438,22 +1031,29 @@ pub(in crate::ascend_pi05::model) mod backbone {
                     "π0.5 BF16 device weight depth mismatch".into(),
                 ));
             }
-            Ok(Self {
+            let mut blocks = Self {
+                static_modulation: None,
                 backend,
                 config,
                 weights,
                 policies,
-            })
+            };
+            if cfg!(feature = "ascend-910b-fusions") {
+                let embeddings = crate::ascend_pi05::model::model::upload_time_embeddings_bf16(
+                    &blocks.config,
+                    &blocks.backend,
+                )?;
+                blocks.static_modulation = Some(blocks.prepare_all_modulation(&embeddings)?);
+                crate::ascend_pi05::backend::synchronize(&blocks.backend)?;
+            }
+            Ok(blocks)
         }
 
         fn ctx(&self) -> &Context {
             &self.backend
         }
 
-        pub fn encode_vision_with_dump(
-            &self,
-            patches: &Tensor,
-        ) -> Result<(Tensor, Vec<Tensor>)> {
+        pub fn encode_vision_with_dump(&self, patches: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
             if patches.dtype() != DType::BF16 {
                 return Err(Error::DTypeMismatch {
                     expected: DType::BF16,
@@ -1490,22 +1090,18 @@ pub(in crate::ascend_pi05::model) mod backbone {
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
             )?;
-            // Fused path: gemm_bias (1 op) vs gemm + bias_activation (2 ops).
-            let output = match self.weights.multimodal_projector.bias.as_ref() {
-                Some(bias) => gemm_bias_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    &hidden,
-                    &self.weights.multimodal_projector.weight,
-                    bias,
-                )?,
-                None => gemm_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    &hidden,
-                    &self.weights.multimodal_projector.weight,
-                )?,
-            };
+            let projected = gemm_bf16(
+                self.ctx(),
+                &self.policies,
+                &hidden,
+                &self.weights.multimodal_projector,
+            )?;
+            let output = bias_activation_bf16(
+                self.ctx(),
+                &projected,
+                self.weights.multimodal_projector.bias.as_ref(),
+                PointwiseActivation::None,
+            )?;
             Ok((output, layer_outputs))
         }
 
@@ -1557,42 +1153,33 @@ pub(in crate::ascend_pi05::model) mod backbone {
         ) -> Result<(Tensor, Vec<Tensor>, Option<Bf16ActionLayerInternals>)> {
             if prefix.keys.len() != self.config.action_expert.depth
                 || prefix.values.len() != self.config.action_expert.depth
-                || modulation.attention_scale_weight.len() != self.config.action_expert.depth
-                || modulation.post_attention_scale_weight.len() != self.config.action_expert.depth
+                || modulation.attention.len() != self.config.action_expert.depth
+                || modulation.mlp.len() != self.config.action_expert.depth
             {
                 return Err(Error::Other(
                     "PI0.5 BF16 prefix/modulation depth mismatch".into(),
                 ));
             }
-            let mut hidden = match self.weights.action_in.bias.as_ref() {
-                Some(bias) => gemm_bias_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    state,
-                    &self.weights.action_in.weight,
-                    bias,
-                )?,
-                None => gemm_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    state,
-                    &self.weights.action_in.weight,
-                )?,
-            };
+            let hidden = gemm_bf16(self.ctx(), &self.policies, state, &self.weights.action_in)?;
+            let mut hidden = bias_activation_bf16(
+                self.ctx(),
+                &hidden,
+                self.weights.action_in.bias.as_ref(),
+                PointwiseActivation::None,
+            )?;
             let mut layer_outputs = Vec::with_capacity(self.config.action_expert.depth + 1);
             layer_outputs.push(hidden.clone());
             let mut attention_normalized = None;
             let mut first_block_internals: Option<Bf16ActionLayerInternals> = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
-                let next_scale_weight = if index + 1 < self.config.action_expert.depth {
-                    &modulation.attention_scale_weight[index + 1]
+                let next_norm_modulation = if index + 1 < self.config.action_expert.depth {
+                    &modulation.attention[index + 1]
                 } else {
-                    &modulation.final_norm_scale_weight
+                    &modulation.final_norm
                 };
-                let gate_w = &layer.gate;
-                let up_w = &layer.up;
                 if index == 0 {
+                    // First transformer block: capture internals for alignment.
                     let (output, internals) = action_layer_bf16_with_policies_dump(
                         self.ctx(),
                         &self.policies,
@@ -1600,16 +1187,9 @@ pub(in crate::ascend_pi05::model) mod backbone {
                         layer,
                         &hidden,
                         attention_normalized.as_ref(),
-                        &modulation.attention_scale_weight[index],
-                        &modulation.attention_gate[index],
-                        &modulation.post_attention_scale_weight[index],
-                        &modulation.mlp_gate[index],
-                        next_scale_weight,
-                        &modulation.qkv_bias[index],
-                        &modulation.gate_proj_bias[index],
-                        &modulation.up_proj_bias[index],
-                        &gate_w.weight,
-                        &up_w.weight,
+                        &modulation.attention[index],
+                        &modulation.mlp[index],
+                        next_norm_modulation,
                         &prefix.keys[index],
                         &prefix.values[index],
                         prefix.position_offset,
@@ -1630,16 +1210,9 @@ pub(in crate::ascend_pi05::model) mod backbone {
                         layer,
                         &hidden,
                         attention_normalized.as_ref(),
-                        &modulation.attention_scale_weight[index],
-                        &modulation.attention_gate[index],
-                        &modulation.post_attention_scale_weight[index],
-                        &modulation.mlp_gate[index],
-                        next_scale_weight,
-                        &modulation.qkv_bias[index],
-                        &modulation.gate_proj_bias[index],
-                        &modulation.up_proj_bias[index],
-                        &gate_w.weight,
-                        &up_w.weight,
+                        &modulation.attention[index],
+                        &modulation.mlp[index],
+                        next_norm_modulation,
                         &prefix.keys[index],
                         &prefix.values[index],
                         prefix.position_offset,
@@ -1656,12 +1229,17 @@ pub(in crate::ascend_pi05::model) mod backbone {
             let hidden = attention_normalized.ok_or_else(|| {
                 Error::Other("PI0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = gemm_bias_bf16(
+            let velocity = gemm_bf16(
                 self.ctx(),
                 &self.policies,
                 &hidden,
-                &self.weights.action_out.weight,
-                &modulation.action_out_bias,
+                &self.weights.action_out,
+            )?;
+            let velocity = bias_activation_bf16(
+                self.ctx(),
+                &velocity,
+                self.weights.action_out.bias.as_ref(),
+                PointwiseActivation::None,
             )?;
             let next_state = euler_update_bf16(self.ctx(), state, &velocity, dt)?;
             Ok((next_state, layer_outputs, first_block_internals))
@@ -1701,22 +1279,18 @@ pub(in crate::ascend_pi05::model) mod backbone {
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
             )?;
-            // Fused path: gemm_bias (1 op) vs gemm + bias_activation (2 ops).
-            match self.weights.multimodal_projector.bias.as_ref() {
-                Some(bias) => gemm_bias_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    &hidden,
-                    &self.weights.multimodal_projector.weight,
-                    bias,
-                ),
-                None => gemm_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    &hidden,
-                    &self.weights.multimodal_projector.weight,
-                ),
-            }
+            let projected = gemm_bf16(
+                self.ctx(),
+                &self.policies,
+                &hidden,
+                &self.weights.multimodal_projector,
+            )?;
+            bias_activation_bf16(
+                self.ctx(),
+                &projected,
+                self.weights.multimodal_projector.bias.as_ref(),
+                PointwiseActivation::None,
+            )
         }
 
         pub fn embed_prefix(
@@ -1785,7 +1359,7 @@ pub(in crate::ascend_pi05::model) mod backbone {
                 self.ctx(),
                 &self.policies,
                 time_embedding,
-                &self.weights.time_mlp_in.weight,
+                &self.weights.time_mlp_in,
             )?;
             let hidden = bias_activation_bf16(
                 self.ctx(),
@@ -1797,7 +1371,7 @@ pub(in crate::ascend_pi05::model) mod backbone {
                 self.ctx(),
                 &self.policies,
                 &hidden,
-                &self.weights.time_mlp_out.weight,
+                &self.weights.time_mlp_out,
             )?;
             bias_activation_bf16(
                 self.ctx(),
@@ -1807,10 +1381,8 @@ pub(in crate::ascend_pi05::model) mod backbone {
             )
         }
 
-        /// Compute modulation vector = dense(cond) + bias, then reshape to 1D.
-        /// Output shape: [3 * hidden] (scale, shift, gate concatenated).
-        fn modulation_raw(&self, conditioning: &Tensor, weights: &Bf16LinearWeights) -> Result<Tensor> {
-            let projected = gemm_bf16(self.ctx(), &self.policies, conditioning, &weights.weight)?;
+        fn modulation(&self, conditioning: &Tensor, weights: &Bf16LinearWeights) -> Result<Tensor> {
+            let projected = gemm_bf16(self.ctx(), &self.policies, conditioning, weights)?;
             let modulation = bias_activation_bf16(
                 self.ctx(),
                 &projected,
@@ -1820,478 +1392,38 @@ pub(in crate::ascend_pi05::model) mod backbone {
             modulation.reshape(vec![modulation.numel()])
         }
 
-        /// Split a 1D modulation [3*hidden] into (scale, shift, gate) each [hidden].
-        fn split_modulation(&self, modulation: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-            let cols = modulation.shape().dims()[0];
-            if cols % 3 != 0 {
-                return Err(Error::Other(format!(
-                    "modulation length {} not divisible by 3", cols
-                )));
-            }
-            let hidden = cols / 3;
-            let bytes = hidden * DType::BF16.size_in_bytes();
-            let scale = bf16_vector_prefix(modulation, hidden)?;
-            let shift = DeviceBuffer::from_tensor(modulation)
-                .and_then(|b| b.view(bytes, bytes))
-                .and_then(|b| b.as_tensor(Shape::new(vec![hidden]), DType::BF16))
-                .map_err(|e| Error::Other(format!("split_modulation shift: {e}")))?;
-            let gate = DeviceBuffer::from_tensor(modulation)
-                .and_then(|b| b.view(2 * bytes, bytes))
-                .and_then(|b| b.as_tensor(Shape::new(vec![hidden]), DType::BF16))
-                .map_err(|e| Error::Other(format!("split_modulation gate: {e}")))?;
-            Ok((scale, shift, gate))
-        }
-        
-        /// Compute scale_weight = 1 + scale via aclnnAdds.
-        fn add_one_bf16(&self, input: &Tensor) -> Result<Tensor> {
-            let out = self.ctx().allocate_output(input.shape().clone(), DType::BF16)?;
-            crate::ascend_pi05::backend::ops::aclnn_adds(
-                device_ptr_of(input),
-                device_ptr_of(&out),
-                input.shape(),
-                1.0,
-                DType::BF16,
-                self.ctx().raw_stream(),
-            )?;
-            Ok(out)
-        }
-
-        /// Fold shift into Linear bias: bias = shift @ weight [+ orig_bias].
-        /// shift: [hidden], weight: [in, out] -> bias: [out]
-        fn fold_shift_to_bias(
-            &self,
-            shift: &Tensor,
-            weight: &Tensor,
-            orig_bias: Option<&Tensor>,
-        ) -> Result<Tensor> {
-            let shift_2d = shift.reshape(Shape::new(vec![1, shift.shape().dims()[0]]))?;
-            let folded = gemm_bf16(self.ctx(), &self.policies, &shift_2d, weight)?;
-            let bias = folded.reshape(Shape::new(vec![folded.shape().dims()[1]]))?;
-            if let Some(orig) = orig_bias {
-                let out = self.ctx().allocate_output(bias.shape().clone(), DType::BF16)?;
-                crate::ascend_pi05::backend::ops::aclnn_add(
-                    device_ptr_of(&bias),
-                    device_ptr_of(orig),
-                    device_ptr_of(&out),
-                    bias.shape(),
-                    orig.shape(),
-                    1.0,
-                    DType::BF16,
-                    self.ctx().raw_stream(),
-                )?;
-                Ok(out)
-            } else {
-                Ok(bias)
-            }
-        }
-
         fn prepare_step_modulation(&self, time_embedding: &Tensor) -> Result<Bf16StepModulation> {
             let conditioning = self.conditioning(time_embedding)?;
-            let depth = self.config.action_expert.depth;
-            let mut attention_scale_weight = Vec::with_capacity(depth);
-            let mut attention_gate = Vec::with_capacity(depth);
-            let mut post_attention_scale_weight = Vec::with_capacity(depth);
-            let mut mlp_gate = Vec::with_capacity(depth);
-            let mut qkv_bias = Vec::with_capacity(depth);
-            let mut gate_proj_bias = Vec::with_capacity(depth);
-            let mut up_proj_bias = Vec::with_capacity(depth);
+            let mut attention = Vec::with_capacity(self.config.action_expert.depth);
+            let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
             for layer in &self.weights.action_layers {
-                let raw = self.modulation_raw(&conditioning, &layer.input_modulation)?;
-                let (scale, shift, gate) = self.split_modulation(&raw)?;
-                attention_scale_weight.push(self.add_one_bf16(&scale)?);
-                attention_gate.push(gate);
-                qkv_bias.push(self.fold_shift_to_bias(
-                    &shift, &layer.qkv.weight, layer.qkv.bias.as_ref())?);
-
-                let raw = self.modulation_raw(&conditioning, &layer.post_attention_modulation)?;
-                let (scale, shift, gate) = self.split_modulation(&raw)?;
-                post_attention_scale_weight.push(self.add_one_bf16(&scale)?);
-                mlp_gate.push(gate);
-                let gate_w = &layer.gate;
-                let up_w = &layer.up;
-                gate_proj_bias.push(self.fold_shift_to_bias(
-                    &shift, &gate_w.weight, gate_w.bias.as_ref())?);
-                up_proj_bias.push(self.fold_shift_to_bias(
-                    &shift, &up_w.weight, up_w.bias.as_ref())?);
+                attention.push(self.modulation(&conditioning, &layer.input_modulation)?);
+                mlp.push(self.modulation(&conditioning, &layer.post_attention_modulation)?);
             }
-            let raw = self.modulation_raw(&conditioning, &self.weights.action_final_modulation)?;
-            let (scale, shift, _gate) = self.split_modulation(&raw)?;
-            let final_norm_scale_weight = self.add_one_bf16(&scale)?;
-            let action_out_bias = self.fold_shift_to_bias(
-                &shift, &self.weights.action_out.weight,
-                self.weights.action_out.bias.as_ref())?;
+            let final_norm =
+                self.modulation(&conditioning, &self.weights.action_final_modulation)?;
             Ok(Bf16StepModulation {
-                attention_scale_weight,
-                attention_gate,
-                post_attention_scale_weight,
-                mlp_gate,
-                final_norm_scale_weight,
-                qkv_bias,
-                gate_proj_bias,
-                up_proj_bias,
-                action_out_bias,
+                attention,
+                mlp,
+                final_norm,
             })
         }
 
-        /// In-graph / eager path: keep the zero-copy views as-is.
         pub(super) fn prepare_all_modulation(
             &self,
             time_embeddings: &[Tensor],
         ) -> Result<Vec<Bf16StepModulation>> {
-            self.prepare_all_modulation_inner(time_embeddings, false)
-        }
-
-        /// Iteration 7: pre-compute each per-step modulation so every field
-        /// owns its device storage (deep copies the view-backed gates and the
-        /// folded biases while their backing intermediates are still alive).
-        /// See `prepare_all_modulation_inner` for the materialize flag.
-        pub(in crate::ascend_pi05) fn prepare_all_modulation_materialized(
-            &self,
-            time_embeddings: &[Tensor],
-        ) -> Result<Vec<Bf16StepModulation>> {
-            self.prepare_all_modulation_inner(time_embeddings, true)
-        }
-
-        /// Stack the [1,width] per-step embeddings into a single
-        /// [steps,width] tensor so all conditioning / modulation /
-        /// fold gemms run as batchN (M=steps) instead of repeated batch=1
-        /// matmuls — matching torch_npu's MatMulV3 which has zero batch=1
-        /// gemms. The per-step outputs are recovered via zero-copy row
-        /// views, so `Bf16StepModulation` layout is unchanged and the
-        /// computation is mathematically identical to the per-step path.
-        ///
-        /// When `materialize` is true (out-of-graph prepared path) every
-        /// view-backed field (`attention_gate`, `mlp_gate`, folded biases)
-        /// is deep-copied to an owned standalone buffer *while its backing
-        /// `raw` / `folded` intermediate is still alive*. Without this the
-        /// out-of-session path frees those intermediates as soon as this
-        /// function returns and replays would read freed memory (in-graph
-        /// the pool keeps them alive, which is why the graph path was
-        /// correct without materialization).
-        pub(super) fn prepare_all_modulation_inner(
-            &self,
-            time_embeddings: &[Tensor],
-            materialize: bool,
-        ) -> Result<Vec<Bf16StepModulation>> {
-            let steps = time_embeddings.len();
-            if steps != self.config.num_flow_steps {
+            if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
                     self.config.num_flow_steps,
-                    steps
+                    time_embeddings.len()
                 )));
             }
-            // Stack the [1,width] per-step embeddings into a single
-            // [steps,width] tensor so all conditioning / modulation /
-            // fold gemms run as batchN (M=steps) instead of repeated batch=1
-            // matmuls — matching torch_npu's MatMulV3 which has zero batch=1
-            // gemms. The per-step outputs are recovered via zero-copy row
-            // views, so `Bf16StepModulation` layout is unchanged and the
-            // computation is mathematically identical to the per-step path.
-            let mut embs = time_embeddings[0].clone();
-            for e in &time_embeddings[1..] {
-                embs = l3_concat_rows(self.ctx(), &embs, e)?;
-            }
-            // Batched conditioning: [steps, width] -> [steps, width].
-            let cond = self.conditioning_batched(&embs)?;
-            let depth = self.config.action_expert.depth;
-            let hidden = embs.shape().dims()[1];
-
-            // Per-layer, per-step accumulation.
-            let mut attention_scale_weight = vec![Vec::with_capacity(depth); steps];
-            let mut attention_gate = vec![Vec::with_capacity(depth); steps];
-            let mut post_attention_scale_weight = vec![Vec::with_capacity(depth); steps];
-            let mut mlp_gate = vec![Vec::with_capacity(depth); steps];
-            let mut qkv_bias = vec![Vec::with_capacity(depth); steps];
-            let mut gate_proj_bias = vec![Vec::with_capacity(depth); steps];
-            let mut up_proj_bias = vec![Vec::with_capacity(depth); steps];
-            let mut final_norm_scale_weight = vec![Vec::with_capacity(1); steps];
-            let mut action_out_bias = vec![Vec::with_capacity(1); steps];
-
-            for layer in &self.weights.action_layers {
-                // input modulation raw [steps, 3*hidden]; recover each step's
-                // row ([3*hidden], row-major contiguous) then use the 1D split.
-                let raw = self.modulation_raw_batched(&cond, &layer.input_modulation)?;
-                for s in 0..steps {
-                    let row = self.row_tensor(&raw, s, vec![3 * hidden])?;
-                    let (scale, _shift, gate) = self.split_modulation(&row)?;
-                    let scale_w = self.add_one_bf16(&scale)?;
-                    attention_scale_weight[s].push(scale_w);
-                    let gate = if materialize {
-                        self.materialize_bf16(&gate)?
-                    } else {
-                        gate
-                    };
-                    attention_gate[s].push(gate);
-                }
-                let qkv_bs = self.fold_shift_batched(
-                    &raw,
-                    &layer.qkv.weight,
-                    layer.qkv.bias.as_ref(),
-                    hidden,
-                    None,
-                    materialize,
-                )?;
-                for s in 0..steps {
-                    qkv_bias[s].push(qkv_bs[s].clone());
-                }
-
-                // post-attention modulation raw [steps, 3*hidden]
-                let raw = self.modulation_raw_batched(&cond, &layer.post_attention_modulation)?;
-                for s in 0..steps {
-                    let row = self.row_tensor(&raw, s, vec![3 * hidden])?;
-                    let (scale, _shift, gate) = self.split_modulation(&row)?;
-                    let scale_w = self.add_one_bf16(&scale)?;
-                    post_attention_scale_weight[s].push(scale_w);
-                    let gate = if materialize {
-                        self.materialize_bf16(&gate)?
-                    } else {
-                        gate
-                    };
-                    mlp_gate[s].push(gate);
-                }
-                let gate_w = &layer.gate;
-                let up_w = &layer.up;
-                // Slice the post-attention shift column once; both the gate
-                // and up fold gemms reuse the same bytes (bit-identical numerics).
-                let shift_batched = self.slice_shift_column(&raw, hidden)?;
-                let gate_bs = self.fold_shift_batched(
-                    &raw, &gate_w.weight, gate_w.bias.as_ref(), hidden,
-                    Some(&shift_batched), materialize,
-                )?;
-                let up_bs = self.fold_shift_batched(
-                    &raw, &up_w.weight, up_w.bias.as_ref(), hidden,
-                    Some(&shift_batched), materialize,
-                )?;
-                for s in 0..steps {
-                    gate_proj_bias[s].push(gate_bs[s].clone());
-                    up_proj_bias[s].push(up_bs[s].clone());
-                }
-            }
-            // final + action_out (per-step independent)
-            let raw = self.modulation_raw_batched(&cond, &self.weights.action_final_modulation)?;
-            for s in 0..steps {
-                let row = self.row_tensor(&raw, s, vec![3 * hidden])?;
-                let (scale, _shift, _gate) = self.split_modulation(&row)?;
-                let scale_w = self.add_one_bf16(&scale)?;
-                final_norm_scale_weight[s].push(scale_w);
-            }
-            let out_bs = self.fold_shift_batched(
-                &raw,
-                &self.weights.action_out.weight,
-                self.weights.action_out.bias.as_ref(),
-                hidden,
-                None,
-                materialize,
-            )?;
-            for s in 0..steps {
-                action_out_bias[s].push(out_bs[s].clone());
-            }
-
-            let mut modulations = Vec::with_capacity(steps);
-            for s in 0..steps {
-                modulations.push(Bf16StepModulation {
-                    attention_scale_weight: std::mem::take(&mut attention_scale_weight[s]),
-                    attention_gate: std::mem::take(&mut attention_gate[s]),
-                    post_attention_scale_weight: std::mem::take(
-                        &mut post_attention_scale_weight[s],
-                    ),
-                    mlp_gate: std::mem::take(&mut mlp_gate[s]),
-                    final_norm_scale_weight: std::mem::take(&mut final_norm_scale_weight[s])
-                        .remove(0),
-                    qkv_bias: std::mem::take(&mut qkv_bias[s]),
-                    gate_proj_bias: std::mem::take(&mut gate_proj_bias[s]),
-                    up_proj_bias: std::mem::take(&mut up_proj_bias[s]),
-                    action_out_bias: std::mem::take(&mut action_out_bias[s]).remove(0),
-                });
-            }
-            Ok(modulations)
-        }
-
-        // ── Batched (batchN) modulation helpers ──────────────────────────
-        // These compute the same math as `conditioning` / `modulation_raw` /
-        // `split_modulation` / `add_one_bf16` / `fold_shift_to_bias` but with
-        // M = num_flow_steps (10) rows at once, eliminating the batch=1 gemm
-        // chain that torch_npu does not have in its graph.
-
-        fn conditioning_batched(&self, embs: &Tensor) -> Result<Tensor> {
-            let hidden = gemm_bf16(self.ctx(), &self.policies, embs, &self.weights.time_mlp_in.weight)?;
-            let hidden = bias_activation_bf16(
-                self.ctx(),
-                &hidden,
-                self.weights.time_mlp_in.bias.as_ref(),
-                PointwiseActivation::Silu,
-            )?;
-            let output = gemm_bf16(self.ctx(), &self.policies, &hidden, &self.weights.time_mlp_out.weight)?;
-            bias_activation_bf16(
-                self.ctx(),
-                &output,
-                self.weights.time_mlp_out.bias.as_ref(),
-                PointwiseActivation::Silu,
-            )
-        }
-
-        /// Batch modulation raw: [steps, hidden] @ [hidden, 3*hidden] -> [steps, 3*hidden].
-        fn modulation_raw_batched(
-            &self,
-            conditioning: &Tensor,
-            weights: &Bf16LinearWeights,
-        ) -> Result<Tensor> {
-            let projected = gemm_bf16(self.ctx(), &self.policies, conditioning, &weights.weight)?;
-            bias_activation_bf16(
-                self.ctx(),
-                &projected,
-                weights.bias.as_ref(),
-                PointwiseActivation::None,
-            )
-        }
-
-        /// Zero-copy view of row `r` of a contiguous [R, C] tensor.
-        fn row_tensor(
-            &self,
-            tensor: &Tensor,
-            r: usize,
-            shape_dims: Vec<usize>,
-        ) -> Result<Tensor> {
-            let dims = tensor.shape().dims();
-            let row_bytes = dims[1] * DType::BF16.size_in_bytes();
-            DeviceBuffer::from_tensor(tensor)
-                .and_then(|b| b.view(r * row_bytes, row_bytes))
-                .and_then(|b| b.as_tensor(Shape::new(shape_dims.clone()), DType::BF16))
-                .map_err(|e| Error::Other(format!("row_tensor: {e}")))
-        }
-
-        /// Slice the contiguous shift column `[steps, hidden]` out of a
-        /// `modulation_raw` output `[steps, 3*hidden]` (row-major). Pure copy.
-        fn slice_shift_column(&self, raw: &Tensor, hidden: usize) -> Result<Tensor> {
-            let dims = raw.shape().dims();
-            let steps = dims[0];
-            let shift_batched = self.ctx().allocate_output(
-                Shape::new(vec![steps, hidden]),
-                DType::BF16,
-            )?;
-            crate::ascend_pi05::backend::ops::aclnn_slice_2d(
-                device_ptr_of(raw),
-                raw.shape(),
-                device_ptr_of(&shift_batched),
-                steps,
-                hidden,
-                hidden as i64,
-                DType::BF16,
-                self.ctx().raw_stream(),
-            )?;
-            Ok(shift_batched)
-        }
-
-        /// Batched fold of a `modulation_raw` output `[steps, 3*hidden]` into the
-        /// per-step shift-folded bias vectors, replacing 10 batch=1 gemms with a
-        /// single batch=steps gemm (mathematically identical).
-        ///
-        /// 1. Extract the contiguous shift column `[steps, hidden]` via aclnnSlice
-        ///    (same op already used for QKV split; exact copy, no arithmetic).
-        /// 2. `folded = shift_batched @ weight` -> `[steps, out]` (one gemm).
-        /// 3. Per step: `row_tensor` -> `[out]`, then 1D add `orig_bias` (unchanged
-        ///    from the validated per-step math) -> exactly the previous numerics.
-        ///
-        /// If `precomputed_shift` is `Some`, the caller already sliced the shift
-        /// column (`[steps, hidden]`) from this `raw`; it is reused instead of
-        /// issuing another `aclnnSlice`. This is a pure memory-layout reuse (the
-        /// same bytes feed the fold gemm), so numerics are bit-identical; it only
-        /// removes one duplicated slice op per shared caller.
-        ///
-        /// Returns `steps` bias tensors, each `[out]`, in step order.
-        fn fold_shift_batched(
-            &self,
-            raw: &Tensor,
-            weight: &Tensor,
-            orig_bias: Option<&Tensor>,
-            hidden: usize,
-            precomputed_shift: Option<&Tensor>,
-            materialize: bool,
-        ) -> Result<Vec<Tensor>> {
-            let dims = raw.shape().dims();
-            let steps = dims[0];
-            let out = weight.shape().dims()[1];
-            // 1) contiguous shift column [steps, hidden]
-            let shift_batched = match precomputed_shift {
-                Some(s) => s.clone(),
-                None => {
-                    let shift_batched = self.ctx().allocate_output(
-                        Shape::new(vec![steps, hidden]),
-                        DType::BF16,
-                    )?;
-                    crate::ascend_pi05::backend::ops::aclnn_slice_2d(
-                        device_ptr_of(raw),
-                        raw.shape(),
-                        device_ptr_of(&shift_batched),
-                        steps,
-                        hidden,
-                        hidden as i64,
-                        DType::BF16,
-                        self.ctx().raw_stream(),
-                    )?;
-                    shift_batched
-                }
-            };
-            // 2) single batched fold gemm [steps, out]
-            //    Use MatMulV3 (aclnnMatmul) for these M=steps gemms: measured MAC
-            //    utilization is 13-22% under aclnnFusedMatmul vs 94% under the
-            //    aclnnMatmul path on comparable shapes (verified bit-identical
-            //    output; end-to-end time neutral, structure strictly better).
-            let folded = gemm_bf16_matmul(self.ctx(), &shift_batched, weight)?;
-            // 3) optional bias add — a single batched broadcast add
-            //    `[steps, out] + [out]` replaces the per-step 1D add loop.
-            //    Each row is independently `folded[s,:] + orig_bias[:]`, so the
-            //    per-row floating-point result is bit-identical to the previous
-            //    10 separate 1D adds (no reassociation, no cross-row interaction).
-            let folded = match orig_bias {
-                Some(orig) => {
-                    let out_t = self
-                        .ctx()
-                        .allocate_output(folded.shape().clone(), DType::BF16)?;
-                    crate::ascend_pi05::backend::ops::aclnn_add(
-                        device_ptr_of(&folded),
-                        device_ptr_of(orig),
-                        device_ptr_of(&out_t),
-                        folded.shape(),
-                        orig.shape(),
-                        1.0,
-                        DType::BF16,
-                        self.ctx().raw_stream(),
-                    )?;
-                    out_t
-                }
-                None => folded,
-            };
-            // 4) per-step zero-copy row view (no arithmetic, no extra op).
-            //    When `materialize` (out-of-graph prepared path) deep-copy each
-            //    row here — `folded` is still alive; materializing after this
-            //    function returns would read a freed buffer because `folded`
-            //    is a standalone allocation dropped on return.
-            let mut out_bias = Vec::with_capacity(steps);
-            for s in 0..steps {
-                let row = self.row_tensor(&folded, s, vec![out])?;
-                out_bias.push(if materialize {
-                    self.materialize_bf16(&row)?
-                } else {
-                    row
-                });
-            }
-            Ok(out_bias)
-        }
-
-        /// Identity deep copy of a device BF16 tensor into a standalone buffer.
-        fn materialize_bf16(&self, t: &Tensor) -> Result<Tensor> {
-            let out = self.ctx().allocate_output(t.shape().clone(), DType::BF16)?;
-            crate::ascend_pi05::backend::ops::aclnn_muls(
-                device_ptr_of(t),
-                device_ptr_of(&out),
-                t.shape(),
-                1.0,
-                DType::BF16,
-                self.ctx().raw_stream(),
-            )?;
-            Ok(out)
+            time_embeddings
+                .iter()
+                .map(|embedding| self.prepare_step_modulation(embedding))
+                .collect()
         }
 
         fn denoise_step_with_modulation(
@@ -2303,38 +1435,28 @@ pub(in crate::ascend_pi05::model) mod backbone {
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
                 || prefix.values.len() != self.config.action_expert.depth
-                || modulation.attention_scale_weight.len() != self.config.action_expert.depth
-                || modulation.post_attention_scale_weight.len() != self.config.action_expert.depth
+                || modulation.attention.len() != self.config.action_expert.depth
+                || modulation.mlp.len() != self.config.action_expert.depth
             {
                 return Err(Error::Other(
-                    "PI0.5 BF16 prefix/modulation depth mismatch".into(),
+                    "π0.5 BF16 prefix/modulation depth mismatch".into(),
                 ));
             }
-            let mut hidden = match self.weights.action_in.bias.as_ref() {
-                Some(bias) => gemm_bias_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    state,
-                    &self.weights.action_in.weight,
-                    bias,
-                )?,
-                None => gemm_bf16(
-                    self.ctx(),
-                    &self.policies,
-                    state,
-                    &self.weights.action_in.weight,
-                )?,
-            };
+            let hidden = gemm_bf16(self.ctx(), &self.policies, state, &self.weights.action_in)?;
+            let mut hidden = bias_activation_bf16(
+                self.ctx(),
+                &hidden,
+                self.weights.action_in.bias.as_ref(),
+                PointwiseActivation::None,
+            )?;
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
-                let next_scale_weight = if index + 1 < self.config.action_expert.depth {
-                    &modulation.attention_scale_weight[index + 1]
+                let next_norm_modulation = if index + 1 < self.config.action_expert.depth {
+                    &modulation.attention[index + 1]
                 } else {
-                    &modulation.final_norm_scale_weight
+                    &modulation.final_norm
                 };
-                let gate_w = &layer.gate;
-                let up_w = &layer.up;
                 let output = action_layer_bf16_with_policies(
                     self.ctx(),
                     &self.policies,
@@ -2342,16 +1464,9 @@ pub(in crate::ascend_pi05::model) mod backbone {
                     layer,
                     &hidden,
                     attention_normalized.as_ref(),
-                    &modulation.attention_scale_weight[index],
-                    &modulation.attention_gate[index],
-                    &modulation.post_attention_scale_weight[index],
-                    &modulation.mlp_gate[index],
-                    next_scale_weight,
-                    &modulation.qkv_bias[index],
-                    &modulation.gate_proj_bias[index],
-                    &modulation.up_proj_bias[index],
-                    &gate_w.weight,
-                    &up_w.weight,
+                    &modulation.attention[index],
+                    &modulation.mlp[index],
+                    next_norm_modulation,
                     &prefix.keys[index],
                     &prefix.values[index],
                     prefix.position_offset,
@@ -2364,17 +1479,21 @@ pub(in crate::ascend_pi05::model) mod backbone {
                 attention_normalized = Some(output.next_normalized);
             }
             let hidden = attention_normalized.ok_or_else(|| {
-                Error::Other("PI0.5 action expert must contain at least one layer".into())
+                Error::Other("π0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = gemm_bias_bf16(
+            let velocity = gemm_bf16(
                 self.ctx(),
                 &self.policies,
                 &hidden,
-                &self.weights.action_out.weight,
-                &modulation.action_out_bias,
+                &self.weights.action_out,
             )?;
-            let updated = euler_update_bf16(self.ctx(), state, &velocity, dt)?;
-            Ok(updated)
+            let velocity = bias_activation_bf16(
+                self.ctx(),
+                &velocity,
+                self.weights.action_out.bias.as_ref(),
+                PointwiseActivation::None,
+            )?;
+            euler_update_bf16(self.ctx(), state, &velocity, dt)
         }
 
         pub fn denoise_step(
@@ -2399,7 +1518,12 @@ pub(in crate::ascend_pi05::model) mod backbone {
             let _ = native;
             self.encode_vision(patches)
         }
-        fn embed_prefix(&self, vision: &Tensor, ids: &DeviceBuffer, count: usize) -> Result<Tensor> {
+        fn embed_prefix(
+            &self,
+            vision: &Tensor,
+            ids: &DeviceBuffer,
+            count: usize,
+        ) -> Result<Tensor> {
             self.embed_prefix(vision, ids, count)
         }
         fn prefix(&self, input: &Tensor) -> Result<Self::Prefix> {
@@ -2419,6 +1543,9 @@ pub(in crate::ascend_pi05::model) mod backbone {
             &self,
             embeddings: &[Tensor],
         ) -> Result<Option<Vec<Self::StepModulation>>> {
+            if let Some(modulation) = &self.static_modulation {
+                return Ok(Some(modulation.clone()));
+            }
             self.prepare_all_modulation(embeddings).map(Some)
         }
         fn step(
@@ -2448,28 +1575,40 @@ impl crate::ascend_pi05::model::PrepareBlocks for backbone::Bf16Blocks {
     }
     fn workspace_requirements(
         &self,
-        _tokens: usize,
+        tokens: usize,
     ) -> apxinf_core::Result<crate::ascend_pi05::model::WorkspaceRequirements> {
-        // Workspace pool for aclnn operators + output tensor arena.
-        // Two uses during graph capture: (1) run_op workspace — alloc +
-        // rewind per op, only needs peak single-op size; (2) allocate_output
-        // — accumulates without rewind, needs sum of all output tensors
-        // baked into the captured graph (graph replay writes to these
-        // deterministic addresses).
-        // Pool is reused across inferences (model-runner-level session),
-        // so aclrtMalloc(capacity) happens ONCE — no HBM fragmentation.
-        // Capture-phase pool usage peaks at >4GB with the fused-op path
-        // (gemm_bias + InplaceAddRmsNorm allocate larger combined workspaces
-        // than the unfused matmul+inplace_add+AddRmsNorm sequence). 6GB gives
-        // ample headroom so the pool never overflows (which would return Err
-        // per CUDA semantics — no from_raw_ptr fallback, which leaked
-        // ~5.6GB/run).
-        // Pool is allocated ONCE (model-runner-level session reuse), so 6GB
-        // does not cause HBM fragmentation.
-        // If this returns Err in practice, increase here.
-        Ok(crate::ascend_pi05::model::WorkspaceRequirements {
-            bytes: 6 * 1024 * 1024 * 1024,
-        })
+        // Workspace pool for aclnn operators + output arena.
+        // Two uses: (1) run_op workspace — alloc + rewind per op, only needs
+        // peak single-op size; (2) allocate_output — accumulates without
+        // rewind, needs sum of all output tensors in a forward pass.
+        //
+        // Size the pool from the actual token count like the CUDA-side
+        // reservation (`cuda_graph_workspace_bytes_bf16`) instead of a fixed
+        // 512MB, which under-sized real forwards and pushed every later
+        // output into the individually-malloc'd overflow path (A1).
+        // `APXINF_ASCEND_WORKSPACE_MB` (MiB) overrides the size to force the
+        // overflow path for testing (overflow is now non-leaking).
+        let int8 = self
+            .weights
+            .language_layers
+            .iter()
+            .any(|l| l.gate_up.channel_scales.is_some());
+        let base = if int8 {
+            self.config
+                .cuda_graph_workspace_bytes_int8_dynamic(tokens)?
+        } else {
+            self.config.cuda_graph_workspace_bytes_bf16(tokens)?
+        };
+        let bytes = match std::env::var("APXINF_ASCEND_WORKSPACE_MB") {
+            Ok(v) => v
+                .parse::<usize>()
+                .map(|mib| mib * 1024 * 1024)
+                .unwrap_or(512 * 1024 * 1024),
+            Err(_) => base
+                .checked_add(64 * 1024 * 1024) // headroom for per-op aclnn workspace
+                .unwrap_or(base),
+        };
+        Ok(crate::ascend_pi05::model::WorkspaceRequirements { bytes })
     }
     fn raw_patch_dtype(&self) -> apxinf_core::DType {
         apxinf_core::DType::BF16

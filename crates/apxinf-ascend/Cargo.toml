@@ -5,6 +5,11 @@ edition = "2021"
 license = "Apache-2.0"
 build = "build.rs"
 
+[features]
+default = []
+# Explicitly opt into the CANN 9.0 / Ascend910B native BF16 path.
+910b-fusions = []
+
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-cpu = { path = "../apxinf-cpu" }

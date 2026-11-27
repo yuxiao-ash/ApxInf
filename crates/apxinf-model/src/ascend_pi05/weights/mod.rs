@@ -1,10 +1,11 @@
 //! Ascend device weights for PI0.5.
 //!
-//! BF16-only for now; FP8/INT8 variants will be added later.
+//! BF16 residual storage with optional Selective-99 INT8 projections.
 
 mod bf16;
 mod fp8_static_calibration;
 mod host;
+mod int8_dynamic;
 mod packing;
 
 pub use bf16::*;

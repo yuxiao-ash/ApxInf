@@ -73,6 +73,7 @@ pub enum aclFormat {
     ACL_FORMAT_NCHW = 0,
     ACL_FORMAT_NHWC = 1,
     ACL_FORMAT_ND = 2,
+    ACL_FORMAT_FRACTAL_NZ = 29,
 }
 
 // ---- aclTensor / aclScalar lifecycle (from acl_meta.h) ----
@@ -996,6 +997,59 @@ extern "C" {
         workspace: *mut c_void,
         workspace_size: u64,
         executor: *mut aclOpExecutor,
+        stream: aclrtStream,
+    ) -> aclnnStatus;
+}
+
+extern "C" {
+    pub fn aclnnDynamicQuantGetWorkspaceSize(
+        x: *const aclTensor,
+        smooth: *const aclTensor,
+        out: *const aclTensor,
+        scales: *const aclTensor,
+        workspace: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub fn aclnnDynamicQuant(
+        workspace: *mut c_void,
+        size: u64,
+        executor: *mut aclOpExecutor,
+        stream: crate::ffi::acl::aclrtStream,
+    ) -> aclnnStatus;
+    pub fn aclnnQuantMatmulV4GetWorkspaceSize(
+        a: *const aclTensor,
+        b: *const aclTensor,
+        channel_scales: *const aclTensor,
+        offset: *const aclTensor,
+        row_scales: *const aclTensor,
+        bias: *const aclTensor,
+        transpose_a: bool,
+        transpose_b: bool,
+        out: *const aclTensor,
+        workspace: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub fn aclnnQuantMatmulV4(
+        workspace: *mut c_void,
+        size: u64,
+        executor: *mut aclOpExecutor,
+        stream: crate::ffi::acl::aclrtStream,
+    ) -> aclnnStatus;
+}
+
+extern "C" {
+    pub fn aclnnMmGetWorkspaceSize(
+        a: *const aclTensor,
+        b: *const aclTensor,
+        out: *mut aclTensor,
+        cube_math_type: i8,
+        ws: *mut u64,
+        exec: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub fn aclnnMm(
+        ws: *mut c_void,
+        size: u64,
+        exec: *mut aclOpExecutor,
         stream: aclrtStream,
     ) -> aclnnStatus;
 }

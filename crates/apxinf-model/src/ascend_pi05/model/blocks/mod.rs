@@ -1,6 +1,11 @@
-//! PI0.5 Ascend semantic backbones and layers (BF16 only).
+//! PI0.5 Ascend semantic backbones and layers (BF16 residuals and selective INT8).
 
+#[cfg(feature = "ascend-910b-fusions")]
 pub(super) mod bf16;
+#[cfg(not(feature = "ascend-910b-fusions"))]
+#[path = "bf16_cann.rs"]
+pub(super) mod bf16;
+mod int8_dynamic;
 
 pub(super) use bf16::backbone::Bf16Blocks;
 pub use bf16::backbone::Bf16PrefixKvCache;
@@ -15,16 +20,11 @@ pub(in crate::ascend_pi05) struct L3Policies {
 }
 
 impl Default for L3Policies {
-    /// The port runs the fused aclnn op set, so `gemm_bias` fuses bias into the
-    /// matmul kernel (1 launch instead of matmul + aclnnAdd). This matches the
-    /// torch_npu FULL_FUSION op distribution.
     fn default() -> Self {
         let mut gemm = backend::ops::GemmPolicy::default();
-        gemm.impl_preference = backend::ops::GemmImpl::AclnnFusedMatmul;
-        Self {
-            gemm,
-            attention: backend::ops::AttentionPolicy::default(),
-        }
+        #[cfg(not(feature = "ascend-910b-fusions"))]
+        { gemm.impl_preference = backend::ops::GemmImpl::AclnnFusedMatmul; }
+        Self { gemm, attention: backend::ops::AttentionPolicy::default() }
     }
 }
 

@@ -624,3 +624,6 @@ The generic loader only admits model names; it does not interpret variant names.
 CPU CI exercises each policy through AutoPolicy up to the actual native load
 signature and tests the Rust selection/adaptation rules. It does not establish
 GPU numerical or performance parity.
+
+The opt-in Ascend 910B specialization keeps model scheduling in `ascend_pi05`
+and kernels in `apxinf-ascend`; see [910B](pi05-ascend-910b.md).

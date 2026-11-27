@@ -7,6 +7,8 @@ pub mod attention;
 pub mod cache;
 pub mod gather;
 pub mod gemm;
+#[cfg(feature = "910b-fusions")]
+pub(crate) mod fusions_910b;
 pub mod norm;
 pub mod pointwise;
 pub mod rope;
@@ -156,9 +158,7 @@ pub fn aclnn_split_with_size(
             crate::acl_tensor::AclTensor::from_device(ptr, &out_shape, dtype)
         })
         .collect();
-    let out_raws: Vec<*const crate::ffi::aclnn::aclTensor> =
-        acl_outs.iter().map(|t| t.raw() as *const _).collect();
-    let out_list = crate::acl_tensor::AclTensorList::new(&out_raws);
+    let out_list = crate::acl_tensor::AclTensorList::from_owned(acl_outs)?;
     let split_sizes_arr = crate::acl_tensor::AclIntArray::new(split_sizes);
 
     crate::acl_tensor::run_op(
@@ -188,7 +188,7 @@ pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherPatchGeometry, GatherSemantic};
 pub use gemm::{
     gemm, gemm_bias, gemm_geglu, GemmArgs, GemmBiasArgs, GemmGegluArgs, GemmImpl, GemmPolicy,
-    GemmQuantization, WeightVersion,
+    GemmQuantization, WeightVersion, dynamic_quantize,
 };
 pub use norm::{
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm,

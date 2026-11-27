@@ -3,8 +3,8 @@
 //! Mirrors `apxinf_cuda_new::CudaBuffer` — owns a contiguous device memory
 //! region and supports view/as_tensor conversions.
 
-use apxinf_core::{DType, Device, Error, Result, Shape, Storage, Tensor};
 use crate::buffer::AscendBuffer as InnerBuffer;
+use apxinf_core::{DType, Device, Error, Result, Shape, Storage, Tensor};
 
 /// An Ascend device buffer wrapping a contiguous allocation.
 #[derive(Clone)]
@@ -77,29 +77,18 @@ impl AscendBuffer {
             // context could still be missing on this thread).
             crate::context::restore_context();
             let ret = unsafe {
-                crate::ffi::acl::aclrtMemset(
-                    raw as *mut std::ffi::c_void,
-                    bytes,
-                    0,
-                    bytes,
-                )
+                crate::ffi::acl::aclrtMemset(raw as *mut std::ffi::c_void, bytes, 0, bytes)
             };
             // Auto-recover from CONTEXT_NULL (107002).
             let ret = if ret == 107002 {
                 crate::context::restore_context();
                 unsafe {
-                    crate::ffi::acl::aclrtMemset(
-                        raw as *mut std::ffi::c_void,
-                        bytes,
-                        0,
-                        bytes,
-                    )
+                    crate::ffi::acl::aclrtMemset(raw as *mut std::ffi::c_void, bytes, 0, bytes)
                 }
             } else {
                 ret
             };
-            crate::ffi::acl::check(ret, "aclrtMemset zeros")
-                .map_err(|e| Error::Other(e))?;
+            crate::ffi::acl::check(ret, "aclrtMemset zeros").map_err(|e| Error::Other(e))?;
         }
         Ok(Self { inner, device_id })
     }
@@ -128,12 +117,26 @@ impl AscendBuffer {
             )));
         }
         let inner = InnerBuffer::from_raw_ptr(base + offset, len, self.device_id);
-        Ok(Self { inner, device_id: self.device_id })
+        Ok(Self {
+            inner,
+            device_id: self.device_id,
+        })
     }
 
     /// Borrow this buffer as a tensor with the given shape and dtype.
     pub fn as_tensor(&self, shape: Shape, dtype: DType) -> Result<Tensor> {
-        let handle = self.inner.to_storage_handle();
+        let handle = if crate::is_in_session() {
+            let pool = crate::current_workspace_pool();
+            if pool.is_null() {
+                self.inner.to_storage_handle()
+            } else {
+                unsafe { &*pool }
+                    .output_handle(self.inner.ptr(), self.inner.len())
+                    .unwrap_or_else(|| self.inner.to_storage_handle())
+            }
+        } else {
+            self.inner.to_storage_handle()
+        };
         Ok(unsafe {
             Tensor::from_raw_parts_unchecked(
                 shape,

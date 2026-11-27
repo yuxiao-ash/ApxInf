@@ -1,4 +1,4 @@
-//! PI0.5 Ascend runner: eager + graph capture execution (BF16).
+//! PI0.5 Ascend runner: eager + graph capture execution (BF16 and selective INT8).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -8,13 +8,12 @@ use apxinf_core::{DType, Device, Error, NormalGenerator, Result, Tensor};
 use half::bf16;
 
 use crate::vla::{
-    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent,
-    Observation, PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
 };
 
 use crate::ascend_pi05::backend::{
-    self, ops, transfers, Context, DeviceBuffer, ExecutionSession,
-    ImageLayout as KernelImageLayout,
+    self, ops, transfers, Context, DeviceBuffer, ExecutionSession, ImageLayout as KernelImageLayout,
 };
 use crate::ascend_pi05::model::ModelVariant;
 use crate::ascend_pi05::Pi05Config;
@@ -38,19 +37,19 @@ struct PreparedBuffers {
 /// Owning prepared PI0.5 inference plan (eager or graph-captured).
 pub struct Pi05PreparedInference {
     spec: InferenceSpec,
-    backend: Arc<Context>,
     config: Arc<Pi05Config>,
     model: ModelVariant,
     inputs: EagerInputs,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     captured_graph: Option<CapturedGraph>,
-    /// Out-of-graph pre-computed modulation (iteration 7). Owned standalone
-    /// allocations with fixed addresses; the captured graph references them
-    /// by pointer and never recomputes the modulation chain on replay.
+    #[cfg(not(feature = "ascend-910b-fusions"))]
     modulation: Option<crate::ascend_pi05::model::PreparedModulation>,
     /// Output tensor from the capture run. After graph replay, this tensor's
     /// device buffer contains the new inference result.
     capture_output: Option<Tensor>,
+    fallback_reason: Option<String>,
+    // Release buffers/session before the last context owner.
+    backend: Arc<Context>,
 }
 
 impl Drop for Pi05PreparedInference {
@@ -63,9 +62,7 @@ impl Drop for Pi05PreparedInference {
         // inputs.session (WorkspacePool) before captured_graph, causing
         // aclmdlRIDestroy to segfault on freed pool memory.
         self.captured_graph.take();
-        // Drop the pre-computed modulation next — it is standalone (independent
-        // of the pool), but drop it before capture_output/inputs to keep all
-        // graph-referenced buffers alive until the graph is gone.
+        #[cfg(not(feature = "ascend-910b-fusions"))]
         self.modulation.take();
         // Drop capture_output next — it may reference pool memory.
         self.capture_output.take();
@@ -145,7 +142,7 @@ impl Pi05PreparedInference {
                 self.spec.token_count,
                 &inputs.noise,
                 raw_rgb,
-                None,
+                None::<usize>,
             )
         })?;
 
@@ -160,7 +157,7 @@ impl Pi05PreparedInference {
 
         apxinf_ascend::l3::print_diagnostics();
 
-        Ok(Action::new(action))
+        Ok(Action::new(self.backend.retain_output(&action)?))
     }
 }
 
@@ -177,7 +174,7 @@ impl PreparedInference for Pi05PreparedInference {
         };
         PreparationStatus::Ready {
             mode,
-            fallback_reason: None,
+            fallback_reason: self.fallback_reason.clone(),
         }
     }
 
@@ -217,7 +214,7 @@ impl PreparedInference for Pi05PreparedInference {
                     self.spec.token_count,
                     &self.inputs.noise,
                     raw_rgb,
-                    None,
+                    None::<usize>,
                 )
             })?
         };
@@ -229,14 +226,18 @@ impl PreparedInference for Pi05PreparedInference {
 
         let sync_elapsed = sync_start.elapsed();
 
-        let mode_str = if self.captured_graph.is_some() { "graph" } else { "eager" };
+        let mode_str = if self.captured_graph.is_some() {
+            "graph"
+        } else {
+            "eager"
+        };
         apxinf_ascend::l3::print_diagnostics();
 
-        Ok(Action::new(action))
+        Ok(Action::new(self.backend.retain_output(&action)?))
     }
 }
 
-/// PI0.5 Ascend model runner (eager only).
+/// PI0.5 Ascend model runner (eager and captured).
 pub struct Pi05ModelRunner {
     backend: Arc<Context>,
     config: Arc<Pi05Config>,
@@ -269,10 +270,13 @@ impl Pi05ModelRunner {
         }
         let dtype = self.model.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
-        let patches = backend::to_device(&self.backend, &Tensor::zeros(
-            patch_shape(&self.config),
-            self.model.captured_patch_dtype(raw_rgb),
-        ))?;
+        let patches = backend::to_device(
+            &self.backend,
+            &Tensor::zeros(
+                patch_shape(&self.config),
+                self.model.captured_patch_dtype(raw_rgb),
+            ),
+        )?;
         let noise = backend::to_device(
             &self.backend,
             &Tensor::zeros(noise_shape(&self.config), dtype),
@@ -360,19 +364,18 @@ impl Pi05ModelRunner {
             inputs,
             normal_generator: RefCell::new(normal_generator),
             captured_graph: None,
+            #[cfg(not(feature = "ascend-910b-fusions"))]
             modulation: None,
             capture_output: None,
+            fallback_reason: None,
         })
     }
 
     /// Build a graph-captured prepared inference.
     ///
     /// First runs a warmup pass (same as eager) to stabilize workspace pool
-    /// allocations, pre-computes the per-step modulation OUTSIDE the session
-    /// (standalone allocations with fixed addresses — see iteration 7), then
-    /// captures the forward pass into an RI graph. Subsequent `run` calls
-    /// replay the graph (1 dispatch vs 4761), referencing the fixed-address
-    /// modulation buffers — the graph never recomputes the modulation chain.
+    /// allocations, then captures the forward pass into an RI graph.
+    /// Subsequent `run` calls replay the graph (1 dispatch vs 4761).
     fn build_graphed(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
         let build_start = std::time::Instant::now();
         let PreparedBuffers {
@@ -387,6 +390,7 @@ impl Pi05ModelRunner {
             .then(|| DeviceBuffer::alloc_zeros(image_bytes(&self.config), self.backend.device_id()))
             .transpose()?;
         let inputs = self.prepare_eager_inputs(spec, patches, noise, token_ids, raw_images)?;
+        let raw_rgb = inputs.raw_images.is_some();
 
         // Preprocess RGB outside capture — it uses D2H copy which is
         // forbidden during RI capture.
@@ -395,37 +399,35 @@ impl Pi05ModelRunner {
                 .preprocess_rgb(raw, &inputs.patches, kernel_image_layout(layout))?;
         }
 
-        // Iteration 7: pre-compute modulation OUTSIDE the session/capture.
-        // Standalone aclrtMalloc (weights-like) → addresses stable across the
-        // pool reset that happens inside capture. The graph will only
-        // *reference* these buffers.
-        let modulation = self.model.prepare_modulation()?;
-        // Synchronize the modulation chain's async ops before capture starts —
-        // the captured graph bakes in these buffer addresses and replay reads
-        // them; without a sync the (independent-malloc) buffers could still be
-        // mid-write when the graph's first consumer is enqueued.
-        backend::synchronize(&self.backend)?;
-
-        // Capture ONLY vision/prefix/denoise — the modulation chain is out of
-        // the graph (reused by address on every replay).
+        // Capture only the model.infer forward pass into an RI graph.
         let capture_start = std::time::Instant::now();
         let backend_ref = &self.backend;
         let model_ref = &self.model;
         let inputs_ref = &inputs;
         let token_count = spec.token_count;
-        let modulation_ref = &modulation;
 
         // Graph capture fixes position_offset to None (original mode).
-        // LeRobot-compatible mode (valid_prefix_tokens) requires eager execution
-        // because the offset value changes the RoPE frequencies baked into the graph.
+        // The current public request contract uses the full prefix positions.
+        #[cfg(not(feature = "ascend-910b-fusions"))]
+        let modulation = self.model.prepare_modulation()?;
+        #[cfg(not(feature = "ascend-910b-fusions"))]
+        backend::synchronize(&self.backend)?;
+        #[cfg(feature = "ascend-910b-fusions")]
         let (captured_graph, output) = capture(backend_ref, &inputs.session, || {
-            model_ref.infer_with_prepared_modulation(
+            model_ref.infer(
                 &inputs_ref.patches,
                 &inputs_ref.token_ids,
                 token_count,
                 &inputs_ref.noise,
-                modulation_ref,
+                raw_rgb,
                 None,
+            )
+        })?;
+        #[cfg(not(feature = "ascend-910b-fusions"))]
+        let (captured_graph, output) = capture(backend_ref, &inputs.session, || {
+            model_ref.infer_with_prepared_modulation(
+                &inputs_ref.patches, &inputs_ref.token_ids, token_count,
+                &inputs_ref.noise, &modulation, None,
             )
         })?;
         let capture_elapsed = capture_start.elapsed();
@@ -438,24 +440,39 @@ impl Pi05ModelRunner {
             inputs,
             normal_generator: RefCell::new(normal_generator),
             captured_graph: Some(captured_graph),
+            #[cfg(not(feature = "ascend-910b-fusions"))]
             modulation: Some(modulation),
             capture_output: Some(output),
+            fallback_reason: None,
         })
     }
 
-    fn build_prepared(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
-        // APXINF_NO_GRAPH=1 forces eager mode (for op-distribution profiling).
-        if std::env::var("APXINF_NO_GRAPH").is_ok() {
-                return self.build_eager(spec);
+    fn build_prepared(
+        &self,
+        spec: &InferenceSpec,
+        policy: ExecutionPolicy,
+    ) -> Result<Pi05PreparedInference> {
+        if matches!(policy, ExecutionPolicy::Eager) {
+            return self.build_eager(spec);
         }
-        // Try graph capture first; fall back to eager on failure.
+        if std::env::var_os("APXINF_NO_GRAPH").is_some() {
+            if matches!(policy, ExecutionPolicy::RequireGraph) {
+                return Err(Error::Other(
+                    "RequireGraph conflicts with APXINF_NO_GRAPH".into(),
+                ));
+            }
+            let mut plan = self.build_eager(spec)?;
+            plan.fallback_reason = Some("APXINF_NO_GRAPH disables capture".into());
+            return Ok(plan);
+        }
         match self.build_graphed(spec) {
-            Ok(prepared) => {
-                        Ok(prepared)
+            Ok(plan) => Ok(plan),
+            Err(e) if matches!(policy, ExecutionPolicy::PreferGraph) => {
+                let mut plan = self.build_eager(spec)?;
+                plan.fallback_reason = Some(e.to_string());
+                Ok(plan)
             }
-            Err(e) => {
-                self.build_eager(spec)
-            }
+            Err(e) => Err(e),
         }
     }
 }
@@ -501,7 +518,9 @@ impl VlaRuntime for Pi05ModelRunner {
             {
                 drop(cache.take());
             }
-            cached_or_build(&mut cache, spec, || self.build_prepared(&spec))?
+            cached_or_build(&mut cache, spec, || {
+                self.build_prepared(&spec, ExecutionPolicy::PreferGraph)
+            })?
         };
         let prepare_elapsed = total_start.elapsed();
         let result = prepared.run(request);
@@ -509,15 +528,15 @@ impl VlaRuntime for Pi05ModelRunner {
     }
 
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
-        self.prepare_with_policy(spec, ExecutionPolicy::Eager)
+        self.prepare_with_policy(spec, ExecutionPolicy::PreferGraph)
     }
 
     fn prepare_with_policy(
         &self,
         spec: &InferenceSpec,
-        _policy: ExecutionPolicy,
+        policy: ExecutionPolicy,
     ) -> Result<Box<dyn PreparedInference>> {
-        Ok(Box::new(self.build_prepared(spec)?))
+        Ok(Box::new(self.build_prepared(spec, policy)?))
     }
 
     fn prepare_for(
@@ -530,7 +549,16 @@ impl VlaRuntime for Pi05ModelRunner {
     }
 
     fn execution_mode(&self) -> &'static str {
-        "graph"
+        match self.prepared.borrow().as_ref() {
+            Some((_, prepared)) => {
+                if prepared.captured_graph.is_some() {
+                    "graph"
+                } else {
+                    "eager"
+                }
+            }
+            None => "unprepared",
+        }
     }
 
     fn clear_prepared(&self) -> Result<()> {
@@ -551,6 +579,8 @@ impl VlaRuntime for Pi05ModelRunner {
         let to_f32_elapsed = t2.elapsed();
         result
     }
+
+
     fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         request.observation.validate()?;
         let prepared = self.build_eager(&request.observation.inference_spec())?;
@@ -565,9 +595,11 @@ impl VlaRuntime for Pi05ModelRunner {
     }
 
     fn calibration_plan(&self) -> Result<Vec<String>> {
-        Ok(crate::ascend_pi05::Pi05CalibrationPlan::for_config(&self.config)
-            .sites()
-            .to_vec())
+        Ok(
+            crate::ascend_pi05::Pi05CalibrationPlan::for_config(&self.config)
+                .sites()
+                .to_vec(),
+        )
     }
 }
 
@@ -655,4 +687,152 @@ where
     let value = std::rc::Rc::new(build()?);
     *cache = Some((key, std::rc::Rc::clone(&value)));
     Ok(value)
+}
+
+impl Pi05ModelRunner {
+    pub fn infer_host_f32_with_dump(
+        &self,
+        request: &VlaRequest<'_>,
+    ) -> Result<(
+        Vec<f32>,
+        std::collections::BTreeMap<String, (Vec<f32>, Vec<usize>)>,
+    )> {
+        use std::collections::BTreeMap;
+        request.observation.validate()?;
+        let observation = request.observation;
+        let spec = observation.inference_spec();
+        let prepared = self.build_eager(&spec)?;
+        let raw_rgb = matches!(&observation.vision, VisionObservation::RgbU8 { .. });
+
+        // CRITICAL: copy provided noise/patches/token_ids into the prepared
+        // eager buffers (otherwise they stay at the zeros from
+        // allocate_prepared_buffers). Mirrors run_eager/run update path.
+        prepared.update_eager_inputs(&prepared.inputs, request)?;
+
+        // RGB preprocessing if needed (outside session — input update).
+        if let (Some(raw), Some(layout)) = (&prepared.inputs.raw_images, spec.image_layout) {
+            self.model.preprocess_rgb(
+                raw,
+                &prepared.inputs.patches,
+                kernel_image_layout(layout),
+            )?;
+        }
+
+        apxinf_ascend::l3::reset_diagnostics();
+        let dump = ops::with_session(&prepared.inputs.session, || {
+            self.model.infer_with_dump(
+                &prepared.inputs.patches,
+                &prepared.inputs.token_ids,
+                spec.token_count,
+                &prepared.inputs.noise,
+                None::<usize>,
+            )
+        })?;
+        backend::synchronize(&self.backend)?;
+
+        // Copy all intermediate tensors to host as f32.
+        let tensor_to_f32 = |t: &Tensor| -> Result<(Vec<f32>, Vec<usize>)> {
+            let cpu = backend::to_cpu(t)?;
+            let shape = cpu.shape().dims().to_vec();
+            let data = cpu.to_f32_vec()?;
+            Ok((data, shape))
+        };
+
+        let action_f32 = tensor_to_f32(&dump.action)?;
+        let mut captures: BTreeMap<String, (Vec<f32>, Vec<usize>)> = BTreeMap::new();
+
+        // Vision
+        captures.insert(
+            "vision.output".to_string(),
+            tensor_to_f32(&dump.vision_output)?,
+        );
+        for (i, layer_out) in dump.vision_layer_outputs.iter().enumerate() {
+            captures.insert(
+                format!("vision.layer.{i}.output"),
+                tensor_to_f32(layer_out)?,
+            );
+        }
+
+        // Prefix embedding
+        captures.insert(
+            "prefix.embedding".to_string(),
+            tensor_to_f32(&dump.prefix_embedding)?,
+        );
+
+        // Language layers
+        for (i, layer_out) in dump.language_layer_outputs.iter().enumerate() {
+            captures.insert(
+                format!("language.layer.{i}.output"),
+                tensor_to_f32(layer_out)?,
+            );
+        }
+
+        // Denoise steps
+        for (step, (state, action_layers)) in dump.denoise_step_outputs.iter().enumerate() {
+            captures.insert(format!("denoise.step.{step}.state"), tensor_to_f32(state)?);
+            for (layer, layer_out) in action_layers.iter().enumerate() {
+                captures.insert(
+                    format!("denoise.step.{step}.action_layer.{layer}.output"),
+                    tensor_to_f32(layer_out)?,
+                );
+            }
+        }
+
+        // First transformer block internals per denoise step.
+        // Keys: denoise.step.{step}.block0.{field}
+        for (step, internals_opt) in dump.denoise_step_first_block_internals.iter().enumerate() {
+            let Some(internals) = internals_opt else {
+                continue;
+            };
+            let prefix = format!("denoise.step.{step}.block0");
+            captures.insert(
+                format!("{prefix}.normalized"),
+                tensor_to_f32(&internals.normalized)?,
+            );
+            captures.insert(format!("{prefix}.qkv"), tensor_to_f32(&internals.qkv)?);
+            captures.insert(
+                format!("{prefix}.q_post_rope"),
+                tensor_to_f32(&internals.q_post_rope)?,
+            );
+            captures.insert(
+                format!("{prefix}.k_post_rope"),
+                tensor_to_f32(&internals.k_post_rope)?,
+            );
+            captures.insert(format!("{prefix}.v"), tensor_to_f32(&internals.v)?);
+            captures.insert(
+                format!("{prefix}.attn_out"),
+                tensor_to_f32(&internals.attn_out)?,
+            );
+            captures.insert(
+                format!("{prefix}.attn_proj"),
+                tensor_to_f32(&internals.attn_proj)?,
+            );
+            captures.insert(
+                format!("{prefix}.post_attn_hidden"),
+                tensor_to_f32(&internals.post_attn_hidden)?,
+            );
+            captures.insert(
+                format!("{prefix}.post_attn_norm"),
+                tensor_to_f32(&internals.post_attn_norm)?,
+            );
+            captures.insert(
+                format!("{prefix}.geglu_out"),
+                tensor_to_f32(&internals.geglu_out)?,
+            );
+            captures.insert(
+                format!("{prefix}.mlp_proj"),
+                tensor_to_f32(&internals.mlp_proj)?,
+            );
+            captures.insert(
+                format!("{prefix}.mlp_hidden"),
+                tensor_to_f32(&internals.mlp_hidden)?,
+            );
+            captures.insert(
+                format!("{prefix}.mlp_next_norm"),
+                tensor_to_f32(&internals.mlp_next_norm)?,
+            );
+        }
+
+        Ok((action_f32.0, captures))
+    }
 }

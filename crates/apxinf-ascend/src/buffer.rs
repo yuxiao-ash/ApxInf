@@ -7,8 +7,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use apxinf_core::storage::GpuStorageHandle;
 use apxinf_core::Device;
+use apxinf_core::storage::GpuStorageHandle;
 
 use crate::ffi::acl::{self, aclrtMemMallocPolicy};
 
@@ -91,6 +91,20 @@ impl AscendBuffer {
             len,
             device: Device::Npu(device_id),
             _owner: None,
+        }
+    }
+
+    /// Transfer ownership of an ACL allocation into a shared storage handle.
+    /// The pointer must be a uniquely owned aclrtMalloc allocation; callers
+    /// must cease manually freeing it after this call.
+    pub(crate) unsafe fn from_owned_raw_ptr(ptr: usize, len: usize, device_id: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            device: Device::Npu(device_id),
+            _owner: Some(Arc::new(BufferOwner {
+                ptr: ptr as *mut c_void,
+            })),
         }
     }
 

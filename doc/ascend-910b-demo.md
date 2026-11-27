@@ -1,0 +1,145 @@
+# Ascend 910B integration demo
+
+This branch is based on yuxiao-ash/ApxInf main at
+`d4b08bf44c8370b5903512fd20861077c85294bd`. It integrates the ApxInf 910B
+work through an opt-in `ascend-910b-fusions` feature. Ordinary `ascend` retains
+the fork's CANN BF16 Blocks and its standalone prepared modulation lifetime.
+The 910B Blocks use the same family Model / ModelRunner / weights owners; raw
+launchers, CANN descriptors and immutable packing stay in `apxinf-ascend`.
+
+The demo covers native QKV/RoPE, AdaRMS, gate/residual and single-output GeGLU
+fusions, physical transposed/NZ weight caches, BF16 and selective INT8 loading.
+The current performance/profiling demonstration uses **BF16 only**.
+
+## Build
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.0.0
+export APXINF_ASCEND_SOC=Ascend910B4
+cargo build --release -p apxinf-model --features ascend-910b-fusions \
+  --example pi05_ascend_bench
+```
+
+CMake must be on PATH, or set `CMAKE=/path/to/cmake`. CANN's AscendC toolchain
+and the host C++ headers must be available. On the tested aarch64 image:
+
+```bash
+export CPLUS_INCLUDE_PATH=/usr/include/c++/11:/usr/include/aarch64-linux-gnu/c++/11:/usr/include/aarch64-linux-gnu:/usr/include
+```
+
+Ship the generated `libapxinf_910b_fusions.so` with the benchmark executable
+and include its directory in `LD_LIBRARY_PATH`. CANN libraries also need the
+paths set by `set_env.sh`. Native CMake outputs are scoped to Cargo `OUT_DIR`;
+when moving a checkout, use its own target directory to avoid a stale CMake
+source path.
+
+## Run with aligned inputs
+
+```bash
+/path/to/pi05_ascend_bench /path/to/original-bf16-checkpoint \
+  --model-variant bf16 --token-count 183 --warmup 10 --iterations 100 \
+  --image-input patches --images-u8 /path/to/images_u8.bin \
+  --token-ids-u32le /path/to/tokens183.bin \
+  --noise-bf16-u16le /path/to/noise_bf16_u16le.bin \
+  --dump-actions-f32 /path/to/actions.f32
+```
+
+Checkpoint config selects two/three cameras and Euler10. `patches` binds the
+fixture through the declared patch input representation; the public example
+reports host request latency. The private comparison separately times the
+synchronized model execution, excluding input preprocessing and action D2H.
+Three-view scaling uses a valid duplicate of the first RGB image, not an
+independent third-camera dataset. Both implementations receive identical image,
+token and noise contents.
+
+## Verified integration boundaries
+
+The main branch exports `GpuStorageHandle` under `apxinf_core::storage`; native
+backend ownership references use that current path. The loader retains the
+main branch's explicit config adapter and shared `LoadedModel::Vla` entry.
+Diagnostic dumps are a family runner method rather than adding a method to
+the current shared `VlaRuntime` trait. Unsupported native shapes use CANN,
+and no model-layer code launches an unsafe kernel. Graph resources retain
+context, source/packed weights and outputs until pending work is released.
+
+The fork notes a SplitWithSize crash in its slice-based QKV fallback. The demo
+keeps that fallback and enables the native kernel only for its bounded no-bias
+RoPE contract. This is code evidence of a stack limitation, not a diagnosis
+of every issue encountered by the partner.
+
+## Review and upstream integration
+
+Review this branch against the pinned main SHA. The change intentionally
+keeps vendor and 910B BF16 Blocks in separate files while sharing the existing
+family ownership seams. To migrate to another upstream base, port the feature
+wiring/backend changes and resolve its model-local precision dispatch against
+that checkout's current APIs; do not replace shared model/core APIs with the
+older development checkout. Run both ordinary `ascend` checks and target
+`ascend-910b-fusions` builds, native references, changed-input replay, lifecycle
+and aligned whole-model numerical/performance checks.
+
+Generated logs, fixtures, raw profiles and extracted CSVs remain ignored under
+`devlocal/pi05-910b-demo/`; checkpoints/reference repos are reused in place.
+
+## BF16 measurements on the demo branch
+
+On 910B4-1 / CANN9.0.0, Euler10 with183 valid tokens and fixed RGB/noise:
+
+| Views | ApxInf model ms | IB Robot model ms | Latency reduction |
+| --- | ---: | ---: | ---: |
+| 2 | 53.827643 | 59.135816 | 8.976% |
+| 3 | 65.474431 | 66.981402 | 2.250% |
+
+These are10-warmup/100-sample synchronized model measurements with serialized
+device jobs. Both whole-output numerical gates passed (cosine≥.999,relL2≤.05,
+maxabs≤.05). All four final profiles contain three complete stable graph
+replays and match their own unprofiled outputs. The first3view round failed
+the performance gate; retaining ND for large BF16 down weights fixed it.
+Raw profiles and extracted per-op/per-shape CSVs are retained privately under
+`devlocal/pi05-910b-demo/`. INT8 performance acceptance is deferred; final
+performance/profiling evidence here is BF16.
+
+An additional100-sample BF16 repeat measured53.499305ms /65.410200ms
+(two/three views), both below the corresponding IB primary run. Actions were
+byte-identical to the primary ApxInf outputs.
+
+
+## Fair graph execution comparison (2026-11-27)
+
+IB has graph enabled: TorchAir compiles prefix and the complete Euler10
+denoise into two graphs. ApxInf captures one graph and replays it with
+`aclmdlRIExecuteAsync`. These are different supported graph execution paths.
+
+The newer BF16 comparison starts after device inputs are ready and excludes
+preprocessing, transfers, compilation and output conversion. Both host timers
+cover graph submission through device completion, with 10 warmups/100 samples.
+IB calls its existing compiled prefix/denoise path directly, retaining no_grad
+and all fusion settings. Both profiles now use the same msprof configuration;
+device spans cover the first kernel start through the final kernel end across
+all model streams, including gaps, using three final complete stable replays.
+
+| Views | Apx host graph completion ms | IB host graph completion ms | Apx device graph span ms | IB device graph span ms |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 53.672920 | 59.192333 | 54.619771 | 57.986919 |
+| 3 | 65.595333 | 66.858841 | 66.120241 | 66.117234 |
+
+Two-view device graph execution is about 5.807% faster. Three-view device graph
+execution is effectively tied (0.003ms difference), so the historical 2.250%
+three-view synchronized model lead must not be presented as a pure device
+graph replay advantage. The newer three-view host graph completion lead is
+about 1.890%; these separately captured host/profile metrics cannot be mixed
+to assign that unprofiled difference to individual kernels or host operations.
+No material kernel overlap was observed in IB's multiple streams in these
+three sampled replays. Both whole-output gates passed, and each implementation
+produced identical profiled/unprofiled outputs.
+
+ApxInf uses native QKV split/RoPE, AdaRMS, gated residual and single-output
+GeGLU; IB uses CANN RotaryMul/AddRmsNorm, prepared shift-to-linear-bias folding
+and TorchAir buffer fusion. BF16 prefix gate/up is combined into a wider GEMM
+in ApxInf and remains separate in this IB benchmark. Fewer launches do not
+ensure lower kernel time. Both retain CANN providers for GEMM and attention.
+
+Full raw profiles, byte-identical unfiltered op_summary exports, task selection
+evidence and the numerical comparison remain privately under
+`devlocal/pi05-910b-demo/results/fair-graph-timing/run2/`.

@@ -197,6 +197,14 @@ pub fn rope(ctx: &AscendNewContext, args: RopeArgs<'_>) -> Result<()> {
     let k_out_ptr = k_out_base + kv_offset_bytes;
     let v_out_ptr = v_out_base + kv_offset_bytes;
 
+    #[cfg(feature = "910b-fusions")]
+    if args.semantic == RopeSemantic::SplitQkvRope && args.bias.is_none()
+        && super::fusions_910b::supports_rope(ctx, &args)
+    {
+        let (cos,sin) = get_or_compute_cos_sin(ctx, seq_len, head_dim, args.theta, args.position_offset, q_heads)?;
+        super::fusions_910b::enqueue_rope(ctx, &args, cos, sin)?;
+        return Ok(());
+    }
     // Split Q, K, V via aclnnSlice (3 ops). NOTE: aclnnSplitWithSize SIGSEGVs
     // on this stack (iter4 + iter8), and A2 (iter8) tried binding q/k/v as
     // zero-copy QKV views (skip the slices) — it corrupted numerics + caused
