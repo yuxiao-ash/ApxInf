@@ -103,3 +103,43 @@ performance/profiling evidence here is BF16.
 An additional100-sample BF16 repeat measured53.499305ms /65.410200ms
 (two/three views), both below the corresponding IB primary run. Actions were
 byte-identical to the primary ApxInf outputs.
+
+
+## Fair graph execution comparison (2026-11-27)
+
+IB has graph enabled: TorchAir compiles prefix and the complete Euler10
+denoise into two graphs. ApxInf captures one graph and replays it with
+`aclmdlRIExecuteAsync`. These are different supported graph execution paths.
+
+The newer BF16 comparison starts after device inputs are ready and excludes
+preprocessing, transfers, compilation and output conversion. Both host timers
+cover graph submission through device completion, with 10 warmups/100 samples.
+IB calls its existing compiled prefix/denoise path directly, retaining no_grad
+and all fusion settings. Both profiles now use the same msprof configuration;
+device spans cover the first kernel start through the final kernel end across
+all model streams, including gaps, using three final complete stable replays.
+
+| Views | Apx host graph completion ms | IB host graph completion ms | Apx device graph span ms | IB device graph span ms |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 53.672920 | 59.192333 | 54.619771 | 57.986919 |
+| 3 | 65.595333 | 66.858841 | 66.120241 | 66.117234 |
+
+Two-view device graph execution is about 5.807% faster. Three-view device graph
+execution is effectively tied (0.003ms difference), so the historical 2.250%
+three-view synchronized model lead must not be presented as a pure device
+graph replay advantage. The newer three-view host graph completion lead is
+about 1.890%; these separately captured host/profile metrics cannot be mixed
+to assign that unprofiled difference to individual kernels or host operations.
+No material kernel overlap was observed in IB's multiple streams in these
+three sampled replays. Both whole-output gates passed, and each implementation
+produced identical profiled/unprofiled outputs.
+
+ApxInf uses native QKV split/RoPE, AdaRMS, gated residual and single-output
+GeGLU; IB uses CANN RotaryMul/AddRmsNorm, prepared shift-to-linear-bias folding
+and TorchAir buffer fusion. BF16 prefix gate/up is combined into a wider GEMM
+in ApxInf and remains separate in this IB benchmark. Fewer launches do not
+ensure lower kernel time. Both retain CANN providers for GEMM and attention.
+
+Full raw profiles, byte-identical unfiltered op_summary exports, task selection
+evidence and the numerical comparison remain privately under
+`devlocal/pi05-910b-demo/results/fair-graph-timing/run2/`.
